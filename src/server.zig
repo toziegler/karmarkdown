@@ -595,12 +595,13 @@ fn collectCompletions(
 ) !void {
     const line_slice = getLineSlice(doc.text, pos);
     const ctx = completionContext(line_slice, pos.character);
+    const prefix = completionPrefix(line_slice, pos.character, ctx);
 
     switch (ctx) {
-        .wiki => try appendWikiCompletions(server, items, server.allocator),
-        .inline_anchor => try appendHeadingCompletions(doc, items, server.allocator, true),
-        .inline_path => try appendPathCompletions(server, items, server.allocator),
-        .general => try appendHeadingCompletions(doc, items, server.allocator, false),
+        .wiki => try appendWikiCompletions(server, items, server.allocator, prefix),
+        .inline_anchor => try appendHeadingCompletions(doc, items, server.allocator, true, prefix),
+        .inline_path => try appendPathCompletions(server, doc, items, server.allocator, prefix),
+        .general => try appendHeadingCompletions(doc, items, server.allocator, false, prefix),
     }
 }
 
@@ -619,6 +620,30 @@ fn completionContext(line: []const u8, column: usize) CompletionContext {
     if (inInlineAnchorContext(before)) return .inline_anchor;
     if (inInlinePathContext(before)) return .inline_path;
     return .general;
+}
+
+fn completionPrefix(line: []const u8, column: usize, ctx: CompletionContext) []const u8 {
+    const cursor = @min(column, line.len);
+    const before = line[0..cursor];
+    switch (ctx) {
+        .wiki => {
+            const open = std.mem.lastIndexOf(u8, before, "[[") orelse return "";
+            const tail = before[open + 2 ..];
+            if (std.mem.lastIndexOfScalar(u8, tail, '#')) |hash| {
+                return tail[hash + 1 ..];
+            }
+            return tail;
+        },
+        .inline_path => {
+            const open = std.mem.lastIndexOfScalar(u8, before, '(') orelse return "";
+            return before[open + 1 ..];
+        },
+        .inline_anchor => {
+            const hash = std.mem.lastIndexOfScalar(u8, before, '#') orelse return "";
+            return before[hash + 1 ..];
+        },
+        .general => return "",
+    }
 }
 
 fn inWikiContext(line: []const u8) bool {
@@ -662,12 +687,14 @@ fn appendWikiCompletions(
     server: *Server,
     items: *std.ArrayList(CompletionItem),
     allocator: std.mem.Allocator,
+    prefix: []const u8,
 ) !void {
     var it = server.workspace.docs.iterator();
     while (it.next()) |entry| {
         const path = uriToPath(allocator, entry.key_ptr.*) orelse continue;
         defer allocator.free(path);
         const base = stripExtension(std.fs.path.basename(path));
+        if (!startsWithIgnoreCase(base, prefix)) continue;
         const label = try allocator.dupe(u8, base);
         try items.append(allocator, .{ .label = label });
     }
@@ -675,15 +702,23 @@ fn appendWikiCompletions(
 
 fn appendPathCompletions(
     server: *Server,
+    doc: index.Document,
     items: *std.ArrayList(CompletionItem),
     allocator: std.mem.Allocator,
+    prefix: []const u8,
 ) !void {
+    const doc_path = uriToPath(allocator, doc.uri) orelse return;
+    defer allocator.free(doc_path);
+    const doc_dir = std.fs.path.dirname(doc_path) orelse doc_path;
+
     var it = server.workspace.docs.iterator();
     while (it.next()) |entry| {
         const path = uriToPath(allocator, entry.key_ptr.*) orelse continue;
         defer allocator.free(path);
-        const base = std.fs.path.basename(path);
-        const label = try allocator.dupe(u8, base);
+        const rel = std.fs.path.relative(allocator, doc_dir, path) catch continue;
+        defer allocator.free(rel);
+        if (!startsWithIgnoreCase(rel, prefix)) continue;
+        const label = try allocator.dupe(u8, rel);
         try items.append(allocator, .{ .label = label });
     }
 }
@@ -693,16 +728,36 @@ fn appendHeadingCompletions(
     items: *std.ArrayList(CompletionItem),
     allocator: std.mem.Allocator,
     with_hash: bool,
+    prefix: []const u8,
 ) !void {
     for (doc.headings) |heading| {
         var buf: [256]u8 = undefined;
         const slug = slugifyInto(heading.text, &buf);
+        if (with_hash) {
+            if (!startsWithIgnoreCase(slug, prefix)) continue;
+        } else {
+            if (!startsWithIgnoreCase(heading.text, prefix)) continue;
+        }
         const label = if (with_hash)
             try std.fmt.allocPrint(allocator, "#{s}", .{slug})
         else
             try std.fmt.allocPrint(allocator, "{s}", .{heading.text});
         try items.append(allocator, .{ .label = label });
     }
+}
+
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    if (prefix.len == 0) return true;
+    if (text.len < prefix.len) return false;
+    for (prefix, 0..) |ch, i| {
+        if (lowerAscii(text[i]) != lowerAscii(ch)) return false;
+    }
+    return true;
+}
+
+fn lowerAscii(ch: u8) u8 {
+    if (ch >= 'A' and ch <= 'Z') return ch + 32;
+    return ch;
 }
 
 fn findLinkAt(links: []const parser.Link, pos: protocol.Position) ?parser.Link {
@@ -1159,7 +1214,7 @@ test "completion suggests wiki, paths, and headings" {
 
     try server.workspace.upsertDocument(
         "file:///root/dir/a.md",
-        "[[\n[Link](b.md#)\n# Heading One\n",
+        "[[b\n[Link](b.md#he)\n# Heading One\n## Heading Two\n",
     );
     try server.workspace.upsertDocument(
         "file:///root/dir/b.md",
@@ -1174,24 +1229,33 @@ test "completion suggests wiki, paths, and headings" {
         items.deinit(std.testing.allocator);
     }
 
-    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 2 }, &items);
+    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 3 }, &items);
     sortCompletionItems(items.items);
     const snap = Snap.snap_fn(".");
     const rendered = try renderCompletions(std.testing.allocator, items.items);
     defer std.testing.allocator.free(rendered);
     try snap(@src(),
-        \\a
         \\b
     ).diff(rendered);
 
     items.clearRetainingCapacity();
-    try collectCompletions(&server, doc_a, .{ .line = 1, .character = 13 }, &items);
+    try collectCompletions(&server, doc_a, .{ .line = 1, .character = 12 }, &items);
     sortCompletionItems(items.items);
     const rendered_anchor = try renderCompletions(std.testing.allocator, items.items);
     defer std.testing.allocator.free(rendered_anchor);
     try snap(@src(),
         \\#heading-one
+        \\#heading-two
     ).diff(rendered_anchor);
+
+    items.clearRetainingCapacity();
+    try collectCompletions(&server, doc_a, .{ .line = 1, .character = 8 }, &items);
+    sortCompletionItems(items.items);
+    const rendered_path = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered_path);
+    try snap(@src(),
+        \\b.md
+    ).diff(rendered_path);
 }
 
 test "diagnostics flag unresolved links" {
