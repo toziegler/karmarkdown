@@ -235,6 +235,27 @@ test "workspace remove document clears entry" {
     try std.testing.expect(ws.docs.count() == 0);
 }
 
+test "workspace respects configured extensions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "doc.txt", .data = "# Title\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "# Skip\n" });
+
+    var ws = Workspace.init(std.testing.allocator);
+    defer ws.deinit();
+
+    try ws.setExtensions(&.{".txt"});
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    try ws.addRoot(root_path);
+    try ws.indexRoots();
+
+    try std.testing.expect(ws.docs.count() == 1);
+}
+
 fn hasExtension(path: []const u8, extensions: []const []const u8) bool {
     for (extensions) |ext| {
         if (std.mem.endsWith(u8, path, ext)) return true;

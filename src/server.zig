@@ -140,6 +140,12 @@ fn sendInitializeResponse(writer: anytype, root: std.json.Value) !void {
 fn handleInitialize(server: *Server, root: std.json.Value) !void {
     const params = root.object.get("params") orelse return;
 
+    if (params.object.get("initializationOptions")) |opts| {
+        if (opts == .object) {
+            try applyInitializationOptions(server, opts);
+        }
+    }
+
     if (params.object.get("workspaceFolders")) |folders| {
         if (folders == .array) {
             for (folders.array.items) |item| {
@@ -162,6 +168,27 @@ fn handleInitialize(server: *Server, root: std.json.Value) !void {
     }
 
     try server.workspace.indexRoots();
+}
+
+fn applyInitializationOptions(server: *Server, opts: std.json.Value) !void {
+    if (opts.object.get("extensions")) |exts| {
+        if (exts == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer list.deinit(server.allocator);
+            for (exts.array.items) |item| {
+                if (item != .string) continue;
+                try list.append(server.allocator, item.string);
+            }
+            if (list.items.len > 0) {
+                try server.workspace.setExtensions(list.items);
+            }
+        }
+    }
+    if (opts.object.get("wikiLinks")) |wl| {
+        if (wl == .bool) {
+            server.workspace.setWikiLinks(wl.bool);
+        }
+    }
 }
 
 fn sendNullResult(writer: anytype, root: std.json.Value) !void {
@@ -1111,6 +1138,20 @@ test "diagnostics flag unresolved links" {
         \\Unresolved link @ 0:0-0:11
         \\Unresolved link @ 0:16-0:29
     ).diff(rendered);
+}
+
+test "config disables wiki links" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    server.workspace.setWikiLinks(false);
+    try server.workspace.upsertDocument(
+        "file:///root/a.md",
+        "[[Wiki]]\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/a.md").?;
+    try std.testing.expectEqual(@as(usize, 0), doc_a.links.len);
 }
 
 test "fuzz: symbol JSON is valid" {
