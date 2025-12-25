@@ -83,6 +83,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 try handleDefinition(&server, stdout, root);
                 continue;
             }
+            if (std.mem.eql(u8, m, "textDocument/completion")) {
+                try handleCompletion(&server, stdout, root);
+                continue;
+            }
         }
     }
 }
@@ -126,7 +130,8 @@ fn sendInitializeResponse(writer: anytype, root: std.json.Value) !void {
     try out.writeAll(",\"result\":{\"capabilities\":{");
     try out.writeAll("\"textDocumentSync\":1,");
     try out.writeAll("\"documentSymbolProvider\":true,");
-    try out.writeAll("\"workspaceSymbolProvider\":true");
+    try out.writeAll("\"workspaceSymbolProvider\":true,");
+    try out.writeAll("\"completionProvider\":{\"triggerCharacters\":[\"[\",\"#\"]}");
     try out.writeAll("}}}");
 
     try lsp.writeMessage(writer, payload.items);
@@ -294,6 +299,41 @@ fn handleDefinition(server: *Server, writer: anytype, root: std.json.Value) !voi
     try sendDefinitionResult(writer, root, location.?);
 }
 
+const CompletionItem = struct {
+    label: []const u8,
+};
+
+fn handleCompletion(server: *Server, writer: anytype, root: std.json.Value) !void {
+    const params = root.object.get("params") orelse return;
+    const doc = params.object.get("textDocument") orelse return;
+    const uri_val = doc.object.get("uri") orelse return;
+    const pos_val = params.object.get("position") orelse return;
+    if (uri_val != .string or pos_val != .object) return;
+
+    const line_val = pos_val.object.get("line") orelse return;
+    const char_val = pos_val.object.get("character") orelse return;
+    if (line_val != .integer or char_val != .integer) return;
+
+    const pos = protocol.Position{
+        .line = @intCast(line_val.integer),
+        .character = @intCast(char_val.integer),
+    };
+
+    const doc_opt = server.workspace.getDocument(uri_val.string) orelse {
+        try sendNullResult(writer, root);
+        return;
+    };
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| server.allocator.free(item.label);
+        items.deinit(server.allocator);
+    }
+
+    try collectCompletions(server, doc_opt, pos, &items);
+    try sendCompletionResult(writer, root, items.items);
+}
+
 fn sendSymbolResult(
     writer: anytype,
     root: std.json.Value,
@@ -317,6 +357,33 @@ fn sendSymbolResult(
         try writeSymbolInformation(out, uri, sym);
     }
     try out.writeAll("]}");
+
+    try lsp.writeMessage(writer, payload.items);
+}
+
+fn sendCompletionResult(
+    writer: anytype,
+    root: std.json.Value,
+    items: []const CompletionItem,
+) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.heap.page_allocator);
+
+    var out = payload.writer(std.heap.page_allocator);
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    if (getId(root)) |id_val| {
+        try writeJsonValue(out, id_val);
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"result\":{\"isIncomplete\":false,\"items\":[");
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try out.writeByte(',');
+        try out.writeAll("{\"label\":");
+        try protocol.writeJsonString(out, item.label);
+        try out.writeAll("}");
+    }
+    try out.writeAll("]}}");
 
     try lsp.writeMessage(writer, payload.items);
 }
@@ -403,6 +470,124 @@ fn writeLocation(writer: anytype, location: protocol.Location) !void {
     try writer.writeAll(",\"character\":");
     try writer.print("{d}", .{location.range.end.character});
     try writer.writeAll("}}}");
+}
+
+fn collectCompletions(
+    server: *Server,
+    doc: index.Document,
+    pos: protocol.Position,
+    items: *std.ArrayList(CompletionItem),
+) !void {
+    const line_slice = getLineSlice(doc.text, pos);
+    const ctx = completionContext(line_slice, pos.character);
+
+    switch (ctx) {
+        .wiki => try appendWikiCompletions(server, items, server.allocator),
+        .inline_anchor => try appendHeadingCompletions(doc, items, server.allocator, true),
+        .inline_path => try appendPathCompletions(server, items, server.allocator),
+        .general => try appendHeadingCompletions(doc, items, server.allocator, false),
+    }
+}
+
+const CompletionContext = enum {
+    wiki,
+    inline_path,
+    inline_anchor,
+    general,
+};
+
+fn completionContext(line: []const u8, column: usize) CompletionContext {
+    const cursor = @min(column, line.len);
+    const before = line[0..cursor];
+
+    if (inWikiContext(before)) return .wiki;
+    if (inInlineAnchorContext(before)) return .inline_anchor;
+    if (inInlinePathContext(before)) return .inline_path;
+    return .general;
+}
+
+fn inWikiContext(line: []const u8) bool {
+    const open = std.mem.lastIndexOf(u8, line, "[[") orelse return false;
+    const close = std.mem.lastIndexOf(u8, line, "]]");
+    return close == null or close.? < open;
+}
+
+fn inInlinePathContext(line: []const u8) bool {
+    const open = std.mem.lastIndexOfScalar(u8, line, '(') orelse return false;
+    const close = std.mem.lastIndexOfScalar(u8, line, ')');
+    if (close != null and close.? > open) return false;
+    const bracket = std.mem.lastIndexOfScalar(u8, line, ']') orelse return false;
+    return bracket < open;
+}
+
+fn inInlineAnchorContext(line: []const u8) bool {
+    const open = std.mem.lastIndexOfScalar(u8, line, '(') orelse return false;
+    const close = std.mem.lastIndexOfScalar(u8, line, ')');
+    if (close != null and close.? > open) return false;
+    const hash = std.mem.lastIndexOfScalar(u8, line, '#') orelse return false;
+    return hash > open;
+}
+
+fn getLineSlice(text: []const u8, pos: protocol.Position) []const u8 {
+    var line_start: usize = 0;
+    var current_line: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and current_line < pos.line) : (i += 1) {
+        if (text[i] == '\n') {
+            current_line += 1;
+            line_start = i + 1;
+        }
+    }
+    var line_end = line_start;
+    while (line_end < text.len and text[line_end] != '\n') : (line_end += 1) {}
+    return text[line_start..line_end];
+}
+
+fn appendWikiCompletions(
+    server: *Server,
+    items: *std.ArrayList(CompletionItem),
+    allocator: std.mem.Allocator,
+) !void {
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        const path = uriToPath(allocator, entry.key_ptr.*) orelse continue;
+        defer allocator.free(path);
+        const base = stripExtension(std.fs.path.basename(path));
+        const label = try allocator.dupe(u8, base);
+        try items.append(allocator, .{ .label = label });
+    }
+}
+
+fn appendPathCompletions(
+    server: *Server,
+    items: *std.ArrayList(CompletionItem),
+    allocator: std.mem.Allocator,
+) !void {
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        const path = uriToPath(allocator, entry.key_ptr.*) orelse continue;
+        defer allocator.free(path);
+        const base = std.fs.path.basename(path);
+        const label = try allocator.dupe(u8, base);
+        try items.append(allocator, .{ .label = label });
+    }
+}
+
+fn appendHeadingCompletions(
+    doc: index.Document,
+    items: *std.ArrayList(CompletionItem),
+    allocator: std.mem.Allocator,
+    with_hash: bool,
+) !void {
+    for (doc.headings) |heading| {
+        var buf: [256]u8 = undefined;
+        const slug = slugifyInto(heading.text, &buf);
+        const label = if (with_hash)
+            try std.fmt.allocPrint(allocator, "#{s}", .{slug})
+        else
+            try std.fmt.allocPrint(allocator, "{s}", .{heading.text});
+        try items.append(allocator, .{ .label = label });
+    }
 }
 
 fn findLinkAt(links: []const parser.Link, pos: protocol.Position) ?parser.Link {
@@ -791,6 +976,47 @@ test "definition resolves reference links" {
     try std.testing.expect(std.mem.eql(u8, loc.?.uri, "file:///root/b.md"));
 }
 
+test "completion suggests wiki, paths, and headings" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "[[\n[Link](b.md#)\n# Heading One\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/b.md",
+        "## Heading Two\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| std.testing.allocator.free(item.label);
+        items.deinit(std.testing.allocator);
+    }
+
+    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 2 }, &items);
+    sortCompletionItems(items.items);
+    const snap = Snap.snap_fn(".");
+    const rendered = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered);
+    try snap(@src(),
+        \\a
+        \\b
+    ).diff(rendered);
+
+    items.clearRetainingCapacity();
+    try collectCompletions(&server, doc_a, .{ .line = 1, .character = 13 }, &items);
+    sortCompletionItems(items.items);
+    const rendered_anchor = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered_anchor);
+    try snap(@src(),
+        \\#heading-one
+    ).diff(rendered_anchor);
+}
+
 test "fuzz: symbol JSON is valid" {
     const Context = struct {
         fn testOne(_: @This(), input: []const u8) anyerror!void {
@@ -827,6 +1053,24 @@ test "fuzz: symbol JSON is valid" {
         }
     };
     try std.testing.fuzz(Context{}, Context.testOne, .{});
+}
+
+fn renderCompletions(allocator: std.mem.Allocator, items: []const CompletionItem) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    for (items) |item| {
+        try out.appendSlice(allocator, item.label);
+        try out.appendSlice(allocator, "\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn sortCompletionItems(items: []CompletionItem) void {
+    std.sort.heap(CompletionItem, items, {}, struct {
+        fn lessThan(_: void, a: CompletionItem, b: CompletionItem) bool {
+            return std.mem.lessThan(u8, a.label, b.label);
+        }
+    }.lessThan);
 }
 
 fn sanitizeInput(dst: []u8, src: []const u8) void {
