@@ -1,0 +1,15 @@
+src/clients/c/lib
+/tigerbeetle
+/tigerbeetle.exe
+*_*.tigerbeetle.*
+*_*.tigerbeetle
+.zig-cache/
+zig-cache/
+zig-out/
+
+tools/
+# By convention, logs from simulator use .vopr extension.
+*.vopr
+
+# Death to .DS_Store
+.DS_Store
