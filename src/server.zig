@@ -1027,6 +1027,33 @@ fn extractPayload(message: []const u8) ?[]const u8 {
     return message[idx + marker.len ..];
 }
 
+test "snapshot: definition response" {
+    var obj = std.json.ObjectMap.init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("id", std.json.Value{ .integer = 7 });
+    const root = std.json.Value{ .object = obj };
+
+    const location = protocol.Location{
+        .uri = "file:///root/doc.md",
+        .range = .{
+            .start = .{ .line = 1, .character = 2 },
+            .end = .{ .line = 1, .character = 9 },
+        },
+    };
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try sendDefinitionResult(&out.writer, root, location);
+    const message = try out.toOwnedSlice();
+    defer std.testing.allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":7,"result":[{"uri":"file:///root/doc.md","range":{"start":{"line":1,"character":2},"end":{"line":1,"character":9}}}]}
+    ).diff(payload);
+}
+
 test "definition resolves wiki and inline links" {
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
@@ -1154,6 +1181,79 @@ test "config disables wiki links" {
     try std.testing.expectEqual(@as(usize, 0), doc_a.links.len);
 }
 
+test "initialize options apply extensions and wiki settings" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "doc.txt", .data = "# Title\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "# Skip\n" });
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    const root_uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{root_path});
+    defer std.testing.allocator.free(root_uri);
+
+    var opts = std.json.ObjectMap.init(std.testing.allocator);
+    var exts = std.json.Array.init(std.testing.allocator);
+    try exts.append(std.json.Value{ .string = ".txt" });
+    try opts.put("extensions", std.json.Value{ .array = exts });
+    try opts.put("wikiLinks", std.json.Value{ .bool = false });
+
+    var params = std.json.ObjectMap.init(std.testing.allocator);
+    try params.put("rootUri", std.json.Value{ .string = root_uri });
+    try params.put("initializationOptions", std.json.Value{ .object = opts });
+
+    var root = std.json.ObjectMap.init(std.testing.allocator);
+    try root.put("params", std.json.Value{ .object = params });
+
+    const value = std.json.Value{ .object = root };
+    defer deinitValue(std.testing.allocator, value);
+
+    try handleInitialize(&server, value);
+
+    try std.testing.expectEqual(@as(usize, 1), server.workspace.docs.count());
+    try std.testing.expectEqual(@as(usize, 1), server.workspace.config.extensions.items.len);
+    try std.testing.expectEqual(false, server.workspace.config.wiki_links);
+}
+
+test "didChangeWatchedFiles adds, updates, removes" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "# One\n" });
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "doc.md" });
+    defer std.testing.allocator.free(file_path);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{file_path});
+    defer std.testing.allocator.free(uri);
+
+    const change_create = try changeEventValue(std.testing.allocator, uri, 1);
+    defer deinitValue(std.testing.allocator, change_create);
+    try handleDidChangeWatchedFiles(&server, change_create);
+    const doc_one = server.workspace.getDocument(uri).?;
+    try std.testing.expect(std.mem.startsWith(u8, doc_one.symbols[0].name, "H1: One"));
+
+    try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "# Two\n" });
+    const change_update = try changeEventValue(std.testing.allocator, uri, 2);
+    defer deinitValue(std.testing.allocator, change_update);
+    try handleDidChangeWatchedFiles(&server, change_update);
+    const doc_two = server.workspace.getDocument(uri).?;
+    try std.testing.expect(std.mem.startsWith(u8, doc_two.symbols[0].name, "H1: Two"));
+
+    const change_delete = try changeEventValue(std.testing.allocator, uri, 3);
+    defer deinitValue(std.testing.allocator, change_delete);
+    try handleDidChangeWatchedFiles(&server, change_delete);
+    try std.testing.expect(server.workspace.getDocument(uri) == null);
+}
+
 test "fuzz: symbol JSON is valid" {
     const Context = struct {
         fn testOne(_: @This(), input: []const u8) anyerror!void {
@@ -1192,6 +1292,55 @@ test "fuzz: symbol JSON is valid" {
     try std.testing.fuzz(Context{}, Context.testOne, .{});
 }
 
+test "fuzz: completion and diagnostics JSON are valid" {
+    const Context = struct {
+        fn testOne(_: @This(), input: []const u8) anyerror!void {
+            const max_len: usize = 2048;
+            const len = @min(input.len, max_len);
+            const buf = try std.testing.allocator.alloc(u8, len);
+            defer std.testing.allocator.free(buf);
+            sanitizeInput(buf, input[0..len]);
+
+            var server = Server.init(std.testing.allocator);
+            defer server.deinit();
+
+            try server.workspace.upsertDocument("file:///fuzz.md", buf);
+            const doc = server.workspace.getDocument("file:///fuzz.md").?;
+
+            var items: std.ArrayList(CompletionItem) = .empty;
+            defer {
+                for (items.items) |item| std.testing.allocator.free(item.label);
+                items.deinit(std.testing.allocator);
+            }
+            try collectCompletions(&server, doc, .{ .line = 0, .character = 0 }, &items);
+
+            var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer out.deinit();
+
+            var obj = std.json.ObjectMap.init(std.testing.allocator);
+            defer obj.deinit();
+            try obj.put("id", std.json.Value{ .integer = 1 });
+            const root = std.json.Value{ .object = obj };
+            try sendCompletionResult(&out.writer, root, items.items);
+            const msg = try out.toOwnedSlice();
+            defer std.testing.allocator.free(msg);
+            const payload = extractPayload(msg) orelse return error.TestExpectedPayload;
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+            defer parsed.deinit();
+
+            var diag_out = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer diag_out.deinit();
+            try publishDiagnostics(&server, &diag_out.writer, doc);
+            const diag_msg = try diag_out.toOwnedSlice();
+            defer std.testing.allocator.free(diag_msg);
+            const diag_payload = extractPayload(diag_msg) orelse return error.TestExpectedPayload;
+            var parsed_diag = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, diag_payload, .{});
+            defer parsed_diag.deinit();
+        }
+    };
+    try std.testing.fuzz(Context{}, Context.testOne, .{});
+}
+
 fn renderCompletions(allocator: std.mem.Allocator, items: []const CompletionItem) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
@@ -1219,6 +1368,48 @@ fn renderDiagnostics(allocator: std.mem.Allocator, diags: []const Diagnostic) ![
         );
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn changeEventValue(
+    allocator: std.mem.Allocator,
+    uri: []const u8,
+    change_type: i64,
+) !std.json.Value {
+    var change_obj = std.json.ObjectMap.init(allocator);
+    try change_obj.put("uri", std.json.Value{ .string = uri });
+    try change_obj.put("type", std.json.Value{ .integer = change_type });
+
+    var changes = std.json.Array.init(allocator);
+    try changes.append(std.json.Value{ .object = change_obj });
+
+    var params = std.json.ObjectMap.init(allocator);
+    try params.put("changes", std.json.Value{ .array = changes });
+
+    var root = std.json.ObjectMap.init(allocator);
+    try root.put("params", std.json.Value{ .object = params });
+
+    return std.json.Value{ .object = root };
+}
+
+fn deinitValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                deinitValue(allocator, entry.value_ptr.*);
+            }
+            var mutable = obj;
+            mutable.deinit();
+        },
+        .array => |arr| {
+            for (arr.items) |item| {
+                deinitValue(allocator, item);
+            }
+            var mutable = arr;
+            mutable.deinit();
+        },
+        else => {},
+    }
 }
 
 fn sortCompletionItems(items: []CompletionItem) void {
