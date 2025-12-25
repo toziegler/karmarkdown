@@ -360,6 +360,13 @@ const Diagnostic = struct {
     severity: u8,
 };
 
+const LinkIssue = enum {
+    none,
+    missing_reference,
+    missing_target,
+    missing_anchor,
+};
+
 fn handleCompletion(server: *Server, writer: anytype, root: std.json.Value) !void {
     const params = root.object.get("params") orelse return;
     const doc = params.object.get("textDocument") orelse return;
@@ -489,18 +496,118 @@ fn collectDiagnostics(server: *Server, doc: index.Document) ![]Diagnostic {
     errdefer list.deinit(server.allocator);
 
     for (doc.links) |link| {
-        const resolved = try resolveLink(server, doc, link);
-        if (resolved == null) {
-            const message = try server.allocator.dupe(u8, "Unresolved link");
-            try list.append(server.allocator, .{
-                .range = link.range,
-                .message = message,
-                .severity = 2,
-            });
-        }
+        const issue = try analyzeLink(server, doc, link);
+        if (issue == .none) continue;
+        const message = try server.allocator.dupe(u8, issueMessage(issue));
+        try list.append(server.allocator, .{
+            .range = link.range,
+            .message = message,
+            .severity = 2,
+        });
     }
 
     return list.toOwnedSlice(server.allocator);
+}
+
+fn analyzeLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !LinkIssue {
+    switch (link.kind) {
+        .wiki => return analyzeWikiLink(server, doc, link),
+        .inline_link => return analyzeInlineLink(server, doc, link),
+        .reference => return analyzeReferenceLink(server, doc, link),
+    }
+}
+
+fn analyzeReferenceLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !LinkIssue {
+    const label = link.target.label orelse return .missing_reference;
+    const norm_label = normalizeLabel(label);
+    for (doc.link_defs) |def| {
+        if (std.mem.eql(u8, normalizeLabel(def.label), norm_label)) {
+            return analyzeInlineTarget(server, doc, def.target);
+        }
+    }
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.link_defs) |def| {
+            if (!std.mem.eql(u8, normalizeLabel(def.label), norm_label)) continue;
+            return analyzeInlineTarget(server, entry.value_ptr.*, def.target);
+        }
+    }
+    return .missing_reference;
+}
+
+fn analyzeInlineLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !LinkIssue {
+    return analyzeInlineTarget(server, doc, link.target);
+}
+
+fn analyzeWikiLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !LinkIssue {
+    const raw = link.target.path orelse "";
+    const target_uri = if (raw.len == 0)
+        doc.uri
+    else if (looksLikePath(raw))
+        (try resolvePathUri(server, doc.uri, raw) orelse return .missing_target)
+    else
+        (findDocByTitle(server, raw) orelse return .missing_target);
+
+    if (link.target.anchor) |anchor| {
+        if (!anchorExists(server, target_uri, anchor)) return .missing_anchor;
+    }
+    return .none;
+}
+
+fn analyzeInlineTarget(
+    server: *Server,
+    base_doc: index.Document,
+    target: parser.LinkTarget,
+) !LinkIssue {
+    const path = target.path orelse "";
+    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) {
+        return .none;
+    }
+    const target_uri = if (path.len == 0)
+        base_doc.uri
+    else
+        (try resolvePathUri(server, base_doc.uri, path) orelse return .missing_target);
+    if (target.anchor) |anchor| {
+        if (!anchorExists(server, target_uri, anchor)) return .missing_anchor;
+    }
+    return .none;
+}
+
+fn anchorExists(server: *Server, uri: []const u8, anchor: []const u8) bool {
+    const doc_opt = server.workspace.getDocument(uri) orelse return false;
+    var target_buf: [256]u8 = undefined;
+    const target = slugifyInto(anchor, &target_buf);
+    for (doc_opt.headings) |heading| {
+        var head_buf: [256]u8 = undefined;
+        const head = slugifyInto(heading.text, &head_buf);
+        if (std.mem.eql(u8, head, target)) return true;
+    }
+    return false;
+}
+
+fn issueMessage(issue: LinkIssue) []const u8 {
+    return switch (issue) {
+        .none => "",
+        .missing_reference => "Undefined link reference",
+        .missing_target => "Missing target file",
+        .missing_anchor => "Missing heading anchor",
+    };
 }
 
 fn sendWorkspaceSymbolResult(
@@ -1258,13 +1365,17 @@ test "completion suggests wiki, paths, and headings" {
     ).diff(rendered_path);
 }
 
-test "diagnostics flag unresolved links" {
+test "diagnostics report link issues" {
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
 
     try server.workspace.upsertDocument(
         "file:///root/a.md",
-        "[[missing]] and [Link](b.md)",
+        "[[missing]] [Link](b.md#missing) [Ref][label]",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/b.md",
+        "# Exists\n",
     );
 
     const doc_a = server.workspace.getDocument("file:///root/a.md").?;
@@ -1279,8 +1390,9 @@ test "diagnostics flag unresolved links" {
 
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\Unresolved link @ 0:0-0:11
-        \\Unresolved link @ 0:16-0:29
+        \\Missing target file @ 0:0-0:11
+        \\Missing heading anchor @ 0:12-0:33
+        \\Undefined link reference @ 0:34-0:46
     ).diff(rendered);
 }
 
