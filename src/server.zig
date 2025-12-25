@@ -60,11 +60,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
             if (std.mem.eql(u8, m, "exit")) break;
 
             if (std.mem.eql(u8, m, "textDocument/didOpen")) {
-                try handleDidOpen(&server, root);
+                try handleDidOpen(&server, stdout, root);
                 continue;
             }
             if (std.mem.eql(u8, m, "textDocument/didChange")) {
-                try handleDidChange(&server, root);
+                try handleDidChange(&server, stdout, root);
                 continue;
             }
             if (std.mem.eql(u8, m, "workspace/didChangeWatchedFiles")) {
@@ -180,7 +180,7 @@ fn sendNullResult(writer: anytype, root: std.json.Value) !void {
     try lsp.writeMessage(writer, payload.items);
 }
 
-fn handleDidOpen(server: *Server, root: std.json.Value) !void {
+fn handleDidOpen(server: *Server, writer: anytype, root: std.json.Value) !void {
     const params = root.object.get("params") orelse return;
     const doc = params.object.get("textDocument") orelse return;
     const uri = doc.object.get("uri") orelse return;
@@ -188,9 +188,12 @@ fn handleDidOpen(server: *Server, root: std.json.Value) !void {
 
     if (uri != .string or text != .string) return;
     try server.workspace.upsertDocument(uri.string, text.string);
+    if (server.workspace.getDocument(uri.string)) |doc_val| {
+        try publishDiagnostics(server, writer, doc_val);
+    }
 }
 
-fn handleDidChange(server: *Server, root: std.json.Value) !void {
+fn handleDidChange(server: *Server, writer: anytype, root: std.json.Value) !void {
     const params = root.object.get("params") orelse return;
     const doc = params.object.get("textDocument") orelse return;
     const uri = doc.object.get("uri") orelse return;
@@ -203,6 +206,9 @@ fn handleDidChange(server: *Server, root: std.json.Value) !void {
     if (text_value != .string) return;
 
     try server.workspace.upsertDocument(uri.string, text_value.string);
+    if (server.workspace.getDocument(uri.string)) |doc_val| {
+        try publishDiagnostics(server, writer, doc_val);
+    }
 }
 
 fn handleDidChangeWatchedFiles(server: *Server, root: std.json.Value) !void {
@@ -303,6 +309,12 @@ const CompletionItem = struct {
     label: []const u8,
 };
 
+const Diagnostic = struct {
+    range: protocol.Range,
+    message: []const u8,
+    severity: u8,
+};
+
 fn handleCompletion(server: *Server, writer: anytype, root: std.json.Value) !void {
     const params = root.object.get("params") orelse return;
     const doc = params.object.get("textDocument") orelse return;
@@ -386,6 +398,64 @@ fn sendCompletionResult(
     try out.writeAll("]}}");
 
     try lsp.writeMessage(writer, payload.items);
+}
+
+fn publishDiagnostics(
+    server: *Server,
+    writer: anytype,
+    doc: index.Document,
+) !void {
+    const diagnostics = try collectDiagnostics(server, doc);
+    defer {
+        for (diagnostics) |diag| server.allocator.free(diag.message);
+        server.allocator.free(diagnostics);
+    }
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.heap.page_allocator);
+
+    var out = payload.writer(std.heap.page_allocator);
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+    try protocol.writeJsonString(out, doc.uri);
+    try out.writeAll(",\"diagnostics\":[");
+    for (diagnostics, 0..) |diag, idx| {
+        if (idx > 0) try out.writeByte(',');
+        try out.writeAll("{\"range\":{\"start\":{\"line\":");
+        try out.print("{d}", .{diag.range.start.line});
+        try out.writeAll(",\"character\":");
+        try out.print("{d}", .{diag.range.start.character});
+        try out.writeAll("},\"end\":{\"line\":");
+        try out.print("{d}", .{diag.range.end.line});
+        try out.writeAll(",\"character\":");
+        try out.print("{d}", .{diag.range.end.character});
+        try out.writeAll("}},\"severity\":");
+        try out.print("{d}", .{diag.severity});
+        try out.writeAll(",\"source\":\"huntsman\",\"message\":");
+        try protocol.writeJsonString(out, diag.message);
+        try out.writeAll("}");
+    }
+    try out.writeAll("]}}");
+
+    try lsp.writeMessage(writer, payload.items);
+}
+
+fn collectDiagnostics(server: *Server, doc: index.Document) ![]Diagnostic {
+    var list: std.ArrayListUnmanaged(Diagnostic) = .empty;
+    errdefer list.deinit(server.allocator);
+
+    for (doc.links) |link| {
+        const resolved = try resolveLink(server, doc, link);
+        if (resolved == null) {
+            const message = try server.allocator.dupe(u8, "Unresolved link");
+            try list.append(server.allocator, .{
+                .range = link.range,
+                .message = message,
+                .severity = 2,
+            });
+        }
+    }
+
+    return list.toOwnedSlice(server.allocator);
 }
 
 fn sendWorkspaceSymbolResult(
@@ -1017,6 +1087,32 @@ test "completion suggests wiki, paths, and headings" {
     ).diff(rendered_anchor);
 }
 
+test "diagnostics flag unresolved links" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/a.md",
+        "[[missing]] and [Link](b.md)",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/a.md").?;
+    const diags = try collectDiagnostics(&server, doc_a);
+    defer {
+        for (diags) |diag| std.testing.allocator.free(diag.message);
+        std.testing.allocator.free(diags);
+    }
+
+    const rendered = try renderDiagnostics(std.testing.allocator, diags);
+    defer std.testing.allocator.free(rendered);
+
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\Unresolved link @ 0:0-0:11
+        \\Unresolved link @ 0:16-0:29
+    ).diff(rendered);
+}
+
 test "fuzz: symbol JSON is valid" {
     const Context = struct {
         fn testOne(_: @This(), input: []const u8) anyerror!void {
@@ -1061,6 +1157,25 @@ fn renderCompletions(allocator: std.mem.Allocator, items: []const CompletionItem
     for (items) |item| {
         try out.appendSlice(allocator, item.label);
         try out.appendSlice(allocator, "\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderDiagnostics(allocator: std.mem.Allocator, diags: []const Diagnostic) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    for (diags) |diag| {
+        try out.appendSlice(allocator, diag.message);
+        try out.appendSlice(allocator, " @ ");
+        try out.writer(allocator).print(
+            "{d}:{d}-{d}:{d}\n",
+            .{
+                diag.range.start.line,
+                diag.range.start.character,
+                diag.range.end.line,
+                diag.range.end.character,
+            },
+        );
     }
     return out.toOwnedSlice(allocator);
 }
