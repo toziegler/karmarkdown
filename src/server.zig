@@ -748,6 +748,18 @@ fn resolveReferenceLink(
             return resolveInlineLink(server, doc, resolved);
         }
     }
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.link_defs) |def| {
+            if (!std.mem.eql(u8, normalizeLabel(def.label), norm_label)) continue;
+            const resolved = parser.Link{
+                .kind = .inline_link,
+                .target = def.target,
+                .range = link.range,
+            };
+            return resolveInlineLink(server, entry.value_ptr.*, resolved);
+        }
+    }
     return null;
 }
 
@@ -1116,6 +1128,29 @@ test "definition resolves reference links" {
     const loc = try resolveLink(&server, doc_a, doc_a.links[0]);
     try std.testing.expect(loc != null);
     try std.testing.expect(std.mem.eql(u8, loc.?.uri, "file:///root/b.md"));
+}
+
+test "definition resolves reference links across files" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/a.md",
+        "[ref][label]\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/defs.md",
+        "[label]: c.md#Heading\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/c.md",
+        "## Heading\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/a.md").?;
+    const loc = try resolveLink(&server, doc_a, doc_a.links[0]);
+    try std.testing.expect(loc != null);
+    try std.testing.expect(std.mem.eql(u8, loc.?.uri, "file:///root/c.md"));
 }
 
 test "completion suggests wiki, paths, and headings" {
