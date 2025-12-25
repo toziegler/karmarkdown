@@ -79,6 +79,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 try handleWorkspaceSymbol(&server, stdout, root);
                 continue;
             }
+            if (std.mem.eql(u8, m, "textDocument/definition")) {
+                try handleDefinition(&server, stdout, root);
+                continue;
+            }
         }
     }
 }
@@ -252,6 +256,44 @@ fn handleWorkspaceSymbol(server: *Server, writer: anytype, root: std.json.Value)
     try sendWorkspaceSymbolResult(writer, root, collected.items);
 }
 
+fn handleDefinition(server: *Server, writer: anytype, root: std.json.Value) !void {
+    const params = root.object.get("params") orelse return;
+    const doc = params.object.get("textDocument") orelse return;
+    const uri_val = doc.object.get("uri") orelse return;
+    const pos_val = params.object.get("position") orelse return;
+    if (uri_val != .string or pos_val != .object) return;
+
+    const line_val = pos_val.object.get("line") orelse return;
+    const char_val = pos_val.object.get("character") orelse return;
+    if (line_val != .integer or char_val != .integer) return;
+
+    const pos = protocol.Position{
+        .line = @intCast(line_val.integer),
+        .character = @intCast(char_val.integer),
+    };
+
+    const doc_opt = server.workspace.getDocument(uri_val.string);
+    if (doc_opt == null) {
+        try sendNullResult(writer, root);
+        return;
+    }
+    const doc_val = doc_opt.?;
+
+    const link_opt = findLinkAt(doc_val.links, pos);
+    if (link_opt == null) {
+        try sendNullResult(writer, root);
+        return;
+    }
+
+    const location = try resolveLink(server, doc_val, link_opt.?);
+    if (location == null) {
+        try sendNullResult(writer, root);
+        return;
+    }
+
+    try sendDefinitionResult(writer, root, location.?);
+}
+
 fn sendSymbolResult(
     writer: anytype,
     root: std.json.Value,
@@ -305,6 +347,28 @@ fn sendWorkspaceSymbolResult(
     try lsp.writeMessage(writer, payload.items);
 }
 
+fn sendDefinitionResult(
+    writer: anytype,
+    root: std.json.Value,
+    location: protocol.Location,
+) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.heap.page_allocator);
+
+    var out = payload.writer(std.heap.page_allocator);
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    if (getId(root)) |id_val| {
+        try writeJsonValue(out, id_val);
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"result\":[");
+    try writeLocation(out, location);
+    try out.writeAll("]}");
+
+    try lsp.writeMessage(writer, payload.items);
+}
+
 fn writeSymbolInformation(
     writer: anytype,
     uri: []const u8,
@@ -325,6 +389,220 @@ fn writeSymbolInformation(
     try writer.writeAll(",\"character\":");
     try writer.print("{d}", .{symbol.range.end.character});
     try writer.writeAll("}}}}");
+}
+
+fn writeLocation(writer: anytype, location: protocol.Location) !void {
+    try writer.writeAll("{\"uri\":");
+    try protocol.writeJsonString(writer, location.uri);
+    try writer.writeAll(",\"range\":{\"start\":{\"line\":");
+    try writer.print("{d}", .{location.range.start.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{location.range.start.character});
+    try writer.writeAll("},\"end\":{\"line\":");
+    try writer.print("{d}", .{location.range.end.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{location.range.end.character});
+    try writer.writeAll("}}}");
+}
+
+fn findLinkAt(links: []const parser.Link, pos: protocol.Position) ?parser.Link {
+    for (links) |link| {
+        if (posInRange(pos, link.range)) return link;
+    }
+    return null;
+}
+
+fn posInRange(pos: protocol.Position, range: protocol.Range) bool {
+    if (pos.line < range.start.line or pos.line > range.end.line) return false;
+    if (pos.line == range.start.line and pos.character < range.start.character) return false;
+    if (pos.line == range.end.line and pos.character > range.end.character) return false;
+    return true;
+}
+
+fn resolveLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !?protocol.Location {
+    switch (link.kind) {
+        .wiki => return resolveWikiLink(server, doc, link),
+        .inline_link => return resolveInlineLink(server, doc, link),
+        .reference => return resolveReferenceLink(server, doc, link),
+    }
+}
+
+fn resolveReferenceLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !?protocol.Location {
+    const label = link.target.label orelse return null;
+    const norm_label = normalizeLabel(label);
+    for (doc.link_defs) |def| {
+        if (std.mem.eql(u8, normalizeLabel(def.label), norm_label)) {
+            const resolved = parser.Link{
+                .kind = .inline_link,
+                .target = def.target,
+                .range = link.range,
+            };
+            return resolveInlineLink(server, doc, resolved);
+        }
+    }
+    return null;
+}
+
+fn resolveInlineLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !?protocol.Location {
+    const path = link.target.path orelse "";
+    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) {
+        return null;
+    }
+    const target_uri = if (path.len == 0)
+        doc.uri
+    else
+        try resolvePathUri(server, doc.uri, path) orelse return null;
+    return findTargetInDoc(server, target_uri, link.target.anchor);
+}
+
+fn resolveWikiLink(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !?protocol.Location {
+    const raw = link.target.path orelse "";
+    if (raw.len == 0) {
+        return findTargetInDoc(server, doc.uri, link.target.anchor);
+    }
+
+    if (looksLikePath(raw)) {
+        const target_uri = try resolvePathUri(server, doc.uri, raw) orelse return null;
+        return findTargetInDoc(server, target_uri, link.target.anchor);
+    }
+
+    const resolved = findDocByTitle(server, raw) orelse return null;
+    return findTargetInDoc(server, resolved, link.target.anchor);
+}
+
+fn findTargetInDoc(
+    server: *Server,
+    uri: []const u8,
+    anchor: ?[]const u8,
+) !?protocol.Location {
+    const doc_opt = server.workspace.getDocument(uri) orelse return null;
+    if (anchor == null) {
+        return .{
+            .uri = uri,
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = 0, .character = 0 },
+            },
+        };
+    }
+    var target_buf: [256]u8 = undefined;
+    const target = slugifyInto(anchor.?, &target_buf);
+    for (doc_opt.headings) |heading| {
+        var head_buf: [256]u8 = undefined;
+        const head = slugifyInto(heading.text, &head_buf);
+        if (std.mem.eql(u8, head, target)) {
+            return .{
+                .uri = uri,
+                .range = heading.range,
+            };
+        }
+    }
+    return null;
+}
+
+fn resolvePathUri(server: *Server, base_uri: []const u8, path: []const u8) !?[]const u8 {
+    if (std.mem.startsWith(u8, path, "file://")) return path;
+    const base_path = uriToPath(server.allocator, base_uri) orelse return null;
+    defer server.allocator.free(base_path);
+
+    const base_dir = std.fs.path.dirname(base_path) orelse base_path;
+    const joined = if (std.fs.path.isAbsolute(path))
+        try std.fs.path.resolve(server.allocator, &.{ path })
+    else
+        try std.fs.path.resolve(server.allocator, &.{ base_dir, path });
+    defer server.allocator.free(joined);
+
+    const normalized = if (!hasMarkdownExtension(joined) and !std.mem.containsAtLeast(u8, joined, 1, "."))
+        try std.fmt.allocPrint(server.allocator, "{s}.md", .{joined})
+    else
+        try server.allocator.dupe(u8, joined);
+    defer server.allocator.free(normalized);
+
+    return findDocByPath(server, normalized);
+}
+
+fn findDocByTitle(server: *Server, title: []const u8) ?[]const u8 {
+    var want_buf: [256]u8 = undefined;
+    const want = slugifyInto(title, &want_buf);
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        const path = uriToPath(server.allocator, entry.key_ptr.*) orelse continue;
+        defer server.allocator.free(path);
+        const base = std.fs.path.basename(path);
+        const base_no_ext = stripExtension(base);
+        var base_buf: [256]u8 = undefined;
+        const base_slug = slugifyInto(base_no_ext, &base_buf);
+        if (std.mem.eql(u8, base_slug, want)) {
+            return entry.key_ptr.*;
+        }
+    }
+    return null;
+}
+
+fn looksLikePath(text: []const u8) bool {
+    return std.mem.containsAtLeast(u8, text, 1, "/") or std.mem.containsAtLeast(u8, text, 1, ".");
+}
+
+fn hasMarkdownExtension(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".md") or std.mem.endsWith(u8, path, ".markdown");
+}
+
+fn stripExtension(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |idx| {
+        return name[0..idx];
+    }
+    return name;
+}
+
+fn normalizeLabel(label: []const u8) []const u8 {
+    return std.mem.trim(u8, label, " \t\n\r");
+}
+
+fn slugifyInto(text: []const u8, buf: []u8) []const u8 {
+    var len: usize = 0;
+    for (text) |ch| {
+        var lower = ch;
+        if (ch >= 'A' and ch <= 'Z') lower = ch + 32;
+        if ((lower >= 'a' and lower <= 'z') or (lower >= '0' and lower <= '9')) {
+            if (len < buf.len) buf[len] = lower;
+            len += 1;
+        } else if (lower == ' ' or lower == '-' or lower == '_') {
+            if (len > 0 and buf[len - 1] != '-') {
+                if (len < buf.len) buf[len] = '-';
+                len += 1;
+            }
+        }
+    }
+    if (len == 0) return buf[0..0];
+    var capped = @min(len, buf.len);
+    while (capped > 0 and buf[capped - 1] == '-') capped -= 1;
+    return buf[0..capped];
+}
+
+fn findDocByPath(server: *Server, path: []const u8) ?[]const u8 {
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        const doc_path = uriToPath(server.allocator, entry.key_ptr.*) orelse continue;
+        defer server.allocator.free(doc_path);
+        if (std.mem.eql(u8, doc_path, path)) return entry.key_ptr.*;
+    }
+    return null;
 }
 
 test "document symbol response is valid JSON" {
@@ -465,6 +743,52 @@ fn extractPayload(message: []const u8) ?[]const u8 {
     const marker = "\r\n\r\n";
     const idx = std.mem.indexOf(u8, message, marker) orelse return null;
     return message[idx + marker.len ..];
+}
+
+test "definition resolves wiki and inline links" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "[[b#Heading]] and [B](b.md#Heading)",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/b.md",
+        "## Heading\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
+    try std.testing.expect(doc_a.links.len >= 2);
+
+    const wiki_loc = try resolveLink(&server, doc_a, doc_a.links[0]);
+    try std.testing.expect(wiki_loc != null);
+    try std.testing.expect(std.mem.eql(u8, wiki_loc.?.uri, "file:///root/dir/b.md"));
+
+    const inline_loc = try resolveLink(&server, doc_a, doc_a.links[1]);
+    try std.testing.expect(inline_loc != null);
+    try std.testing.expect(std.mem.eql(u8, inline_loc.?.uri, "file:///root/dir/b.md"));
+}
+
+test "definition resolves reference links" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/a.md",
+        "[ref][label]\n\n[label]: b.md#Heading\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/b.md",
+        "# Heading\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/a.md").?;
+    try std.testing.expect(doc_a.links.len >= 1);
+
+    const loc = try resolveLink(&server, doc_a, doc_a.links[0]);
+    try std.testing.expect(loc != null);
+    try std.testing.expect(std.mem.eql(u8, loc.?.uri, "file:///root/b.md"));
 }
 
 test "fuzz: symbol JSON is valid" {
