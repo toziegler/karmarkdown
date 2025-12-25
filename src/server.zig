@@ -2,7 +2,9 @@ const std = @import("std");
 const lsp = @import("lsp.zig");
 const protocol = @import("protocol.zig");
 const index = @import("index.zig");
+const parser = @import("parser.zig");
 const search = @import("search.zig");
+const Snap = @import("snaptest.zig").Snap;
 
 const WorkspaceSymbolEntry = struct {
     uri: []const u8,
@@ -47,6 +49,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const method = getString(root, "method");
         if (method) |m| {
             if (std.mem.eql(u8, m, "initialize")) {
+                try handleInitialize(&server, root);
                 try sendInitializeResponse(stdout, root);
                 continue;
             }
@@ -62,6 +65,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
             }
             if (std.mem.eql(u8, m, "textDocument/didChange")) {
                 try handleDidChange(&server, root);
+                continue;
+            }
+            if (std.mem.eql(u8, m, "workspace/didChangeWatchedFiles")) {
+                try handleDidChangeWatchedFiles(&server, root);
                 continue;
             }
             if (std.mem.eql(u8, m, "textDocument/documentSymbol")) {
@@ -121,6 +128,33 @@ fn sendInitializeResponse(writer: anytype, root: std.json.Value) !void {
     try lsp.writeMessage(writer, payload.items);
 }
 
+fn handleInitialize(server: *Server, root: std.json.Value) !void {
+    const params = root.object.get("params") orelse return;
+
+    if (params.object.get("workspaceFolders")) |folders| {
+        if (folders == .array) {
+            for (folders.array.items) |item| {
+                if (item != .object) continue;
+                const uri_val = item.object.get("uri") orelse continue;
+                if (uri_val != .string) continue;
+                if (uriToPath(server.allocator, uri_val.string)) |path| {
+                    defer server.allocator.free(path);
+                    try server.workspace.addRoot(path);
+                }
+            }
+        }
+    } else if (params.object.get("rootUri")) |root_uri| {
+        if (root_uri == .string) {
+            if (uriToPath(server.allocator, root_uri.string)) |path| {
+                defer server.allocator.free(path);
+                try server.workspace.addRoot(path);
+            }
+        }
+    }
+
+    try server.workspace.indexRoots();
+}
+
 fn sendNullResult(writer: anytype, root: std.json.Value) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(std.heap.page_allocator);
@@ -160,6 +194,31 @@ fn handleDidChange(server: *Server, root: std.json.Value) !void {
     if (text_value != .string) return;
 
     try server.workspace.upsertDocument(uri.string, text_value.string);
+}
+
+fn handleDidChangeWatchedFiles(server: *Server, root: std.json.Value) !void {
+    const params = root.object.get("params") orelse return;
+    const changes = params.object.get("changes") orelse return;
+    if (changes != .array) return;
+
+    for (changes.array.items) |change| {
+        if (change != .object) continue;
+        const uri_val = change.object.get("uri") orelse continue;
+        const type_val = change.object.get("type") orelse continue;
+        if (uri_val != .string or type_val != .integer) continue;
+
+        switch (type_val.integer) {
+            1, 2 => {
+                const path = uriToPath(server.allocator, uri_val.string) orelse continue;
+                defer server.allocator.free(path);
+                try server.workspace.upsertDocumentFromPath(path);
+            },
+            3 => {
+                server.workspace.removeDocument(uri_val.string);
+            },
+            else => {},
+        }
+    }
 }
 
 fn handleDocumentSymbol(server: *Server, writer: anytype, root: std.json.Value) !void {
@@ -265,5 +324,202 @@ fn writeSymbolInformation(
     try writer.print("{d}", .{symbol.range.end.line});
     try writer.writeAll(",\"character\":");
     try writer.print("{d}", .{symbol.range.end.character});
-    try writer.writeAll("}}}");
+    try writer.writeAll("}}}}");
+}
+
+test "document symbol response is valid JSON" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.init(allocator);
+    defer obj.deinit();
+    try obj.put("id", std.json.Value{ .integer = 1 });
+
+    const root = std.json.Value{ .object = obj };
+    const symbols = [_]index.Symbol{
+        .{
+            .name = try allocator.dupe(u8, "H1: Title"),
+            .kind = .String,
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = 0, .character = 8 },
+            },
+        },
+    };
+    defer allocator.free(symbols[0].name);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try sendSymbolResult(&out.writer, root, "file:///test.md", &symbols);
+    const payload = try out.toOwnedSlice();
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    try std.testing.expectEqual(@as(usize, 1), result_val.array.items.len);
+}
+
+test "workspace symbol response is valid JSON" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.init(allocator);
+    defer obj.deinit();
+    try obj.put("id", std.json.Value{ .integer = 2 });
+
+    const root = std.json.Value{ .object = obj };
+    const symbol = index.Symbol{
+        .name = try allocator.dupe(u8, "Link: [[Home]]"),
+        .kind = .String,
+        .range = .{
+            .start = .{ .line = 1, .character = 0 },
+            .end = .{ .line = 1, .character = 11 },
+        },
+    };
+    defer allocator.free(symbol.name);
+
+    const entries = [_]WorkspaceSymbolEntry{
+        .{ .uri = "file:///test.md", .symbol = symbol },
+    };
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try sendWorkspaceSymbolResult(&out.writer, root, &entries);
+    const payload = try out.toOwnedSlice();
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    try std.testing.expectEqual(@as(usize, 1), result_val.array.items.len);
+}
+
+test "snapshot: document symbol response" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.init(allocator);
+    defer obj.deinit();
+    try obj.put("id", std.json.Value{ .integer = 1 });
+
+    const root = std.json.Value{ .object = obj };
+    const symbols = [_]index.Symbol{
+        .{
+            .name = try allocator.dupe(u8, "H1: Title"),
+            .kind = .String,
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = 0, .character = 8 },
+            },
+        },
+    };
+    defer allocator.free(symbols[0].name);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try sendSymbolResult(&out.writer, root, "file:///test.md", &symbols);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":1,"result":[{"name":"H1: Title","kind":15,"location":{"uri":"file:///test.md","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}}}}]}
+    ).diff(payload);
+}
+
+test "snapshot: workspace symbol response" {
+    const allocator = std.testing.allocator;
+    var obj = std.json.ObjectMap.init(allocator);
+    defer obj.deinit();
+    try obj.put("id", std.json.Value{ .integer = 2 });
+
+    const root = std.json.Value{ .object = obj };
+    const symbol = index.Symbol{
+        .name = try allocator.dupe(u8, "Link: [[Home]]"),
+        .kind = .String,
+        .range = .{
+            .start = .{ .line = 1, .character = 0 },
+            .end = .{ .line = 1, .character = 11 },
+        },
+    };
+    defer allocator.free(symbol.name);
+
+    const entries = [_]WorkspaceSymbolEntry{
+        .{ .uri = "file:///test.md", .symbol = symbol },
+    };
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try sendWorkspaceSymbolResult(&out.writer, root, &entries);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":2,"result":[{"name":"Link: [[Home]]","kind":15,"location":{"uri":"file:///test.md","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}}}}]}
+    ).diff(payload);
+}
+
+fn extractPayload(message: []const u8) ?[]const u8 {
+    const marker = "\r\n\r\n";
+    const idx = std.mem.indexOf(u8, message, marker) orelse return null;
+    return message[idx + marker.len ..];
+}
+
+test "fuzz: symbol JSON is valid" {
+    const Context = struct {
+        fn testOne(_: @This(), input: []const u8) anyerror!void {
+            const max_len: usize = 2048;
+            const len = @min(input.len, max_len);
+            const buf = try std.testing.allocator.alloc(u8, len);
+            defer std.testing.allocator.free(buf);
+            sanitizeInput(buf, input[0..len]);
+
+            var p = parser.Parser{};
+            const parsed_doc = try p.parse(std.testing.allocator, buf, true);
+            defer {
+                for (parsed_doc.symbols) |sym| std.testing.allocator.free(sym.name);
+                std.testing.allocator.free(parsed_doc.symbols);
+                std.testing.allocator.free(parsed_doc.headings);
+                std.testing.allocator.free(parsed_doc.links);
+                std.testing.allocator.free(parsed_doc.link_defs);
+            }
+
+            var obj = std.json.ObjectMap.init(std.testing.allocator);
+            defer obj.deinit();
+            try obj.put("id", std.json.Value{ .integer = 1 });
+            const root = std.json.Value{ .object = obj };
+
+            var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer out.deinit();
+            try sendSymbolResult(&out.writer, root, "file:///fuzz.md", parsed_doc.symbols);
+            const message = try out.toOwnedSlice();
+            defer std.testing.allocator.free(message);
+
+            const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+            defer parsed.deinit();
+        }
+    };
+    try std.testing.fuzz(Context{}, Context.testOne, .{});
+}
+
+fn sanitizeInput(dst: []u8, src: []const u8) void {
+    for (src, 0..) |ch, i| {
+        if (ch == '\n' or ch == '\t') {
+            dst[i] = ch;
+        } else if (ch < 0x20 or ch == 0x7f) {
+            dst[i] = ' ';
+        } else {
+            dst[i] = ch;
+        }
+    }
+}
+
+fn uriToPath(allocator: std.mem.Allocator, uri: []const u8) ?[]u8 {
+    const prefix = "file://";
+    if (!std.mem.startsWith(u8, uri, prefix)) return null;
+    const path = uri[prefix.len..];
+    return allocator.dupe(u8, path) catch null;
 }

@@ -1,18 +1,60 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const index = @import("index.zig");
+const Snap = @import("snaptest.zig").Snap;
 
 pub const Backend = enum {
     simple,
     tree_sitter,
 };
 
+pub const Heading = struct {
+    level: u8,
+    text: []const u8,
+    range: protocol.Range,
+};
+
+pub const LinkKind = enum {
+    wiki,
+    inline_link,
+    reference,
+};
+
+pub const LinkTarget = struct {
+    path: ?[]const u8,
+    anchor: ?[]const u8,
+    label: ?[]const u8,
+};
+
+pub const Link = struct {
+    kind: LinkKind,
+    target: LinkTarget,
+    range: protocol.Range,
+};
+
+pub const LinkDef = struct {
+    label: []const u8,
+    target: LinkTarget,
+};
+
+pub const ParsedDoc = struct {
+    symbols: []index.Symbol,
+    headings: []Heading,
+    links: []Link,
+    link_defs: []LinkDef,
+};
+
 pub const Parser = struct {
     backend: Backend = .simple,
 
-    pub fn parse(self: *Parser, allocator: std.mem.Allocator, text: []const u8) ![]index.Symbol {
+    pub fn parse(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        enable_wiki: bool,
+    ) !ParsedDoc {
         return switch (self.backend) {
-            .simple => parseSimple(allocator, text),
+            .simple => parseSimple(allocator, text, enable_wiki),
             .tree_sitter => error.TreeSitterUnavailable,
         };
     }
@@ -40,12 +82,18 @@ const Token = struct {
     line_start: bool,
 };
 
+const CodeSpan = struct {
+    start: usize,
+    end: usize,
+};
+
 const Lexer = struct {
     input: []const u8,
     index: usize,
     line: usize,
     column: usize,
     line_start: bool,
+    heading_prefix: bool,
 
     pub fn init(input: []const u8) Lexer {
         return .{
@@ -54,6 +102,7 @@ const Lexer = struct {
             .line = 0,
             .column = 0,
             .line_start = true,
+            .heading_prefix = false,
         };
     }
 
@@ -81,6 +130,7 @@ const Lexer = struct {
             self.line += 1;
             self.column = 0;
             self.line_start = true;
+            self.heading_prefix = false;
             return .{
                 .kind = .Newline,
                 .start = .{ .line = start_line, .character = start_col },
@@ -93,9 +143,10 @@ const Lexer = struct {
 
         self.line_start = false;
 
-        if (ch == '#' and at_line_start) {
+        if (ch == '#' and (at_line_start or self.heading_prefix)) {
             self.index += 1;
             self.column += 1;
+            self.heading_prefix = true;
             return .{
                 .kind = .Hash,
                 .start = .{ .line = start_line, .character = start_col },
@@ -105,6 +156,8 @@ const Lexer = struct {
                 .line_start = at_line_start,
             };
         }
+
+        self.heading_prefix = false;
 
         if (ch == '[') {
             if (self.peekChar() == '[') {
@@ -216,9 +269,14 @@ const ParserState = struct {
     tokens: []Token,
     index: usize,
     symbols: std.ArrayList(index.Symbol),
+    code_spans: []CodeSpan,
+    headings: std.ArrayList(Heading),
+    links: std.ArrayList(Link),
+    link_defs: std.ArrayList(LinkDef),
+    enable_wiki: bool,
 };
 
-fn parseSimple(allocator: std.mem.Allocator, text: []const u8) ![]index.Symbol {
+fn parseSimple(allocator: std.mem.Allocator, text: []const u8, enable_wiki: bool) !ParsedDoc {
     var tokens_list: std.ArrayList(Token) = .empty;
     defer tokens_list.deinit(allocator);
 
@@ -235,18 +293,36 @@ fn parseSimple(allocator: std.mem.Allocator, text: []const u8) ![]index.Symbol {
         .tokens = tokens_list.items,
         .index = 0,
         .symbols = .empty,
+        .code_spans = &.{},
+        .headings = .empty,
+        .links = .empty,
+        .link_defs = .empty,
+        .enable_wiki = enable_wiki,
     };
     errdefer {
         for (state.symbols.items) |sym| allocator.free(sym.name);
         state.symbols.deinit(allocator);
+        state.headings.deinit(allocator);
+        state.links.deinit(allocator);
+        state.link_defs.deinit(allocator);
     }
 
+    const code_spans = try parseBlocksFromLines(&state);
+    defer allocator.free(code_spans);
+    state.code_spans = code_spans;
+
     parseFile(&state);
-    return state.symbols.toOwnedSlice(allocator);
+    return .{
+        .symbols = try state.symbols.toOwnedSlice(allocator),
+        .headings = try state.headings.toOwnedSlice(allocator),
+        .links = try state.links.toOwnedSlice(allocator),
+        .link_defs = try state.link_defs.toOwnedSlice(allocator),
+    };
 }
 
 fn parseFile(state: *ParserState) void {
     while (!at(state, .Eof)) {
+        if (skipCodeSpan(state)) continue;
         if (at(state, .Newline)) {
             _ = bump(state);
             continue;
@@ -269,7 +345,21 @@ fn atHeadingStart(state: *ParserState) bool {
 }
 
 fn atLinkStart(state: *ParserState) bool {
-    return at(state, .DoubleLBracket) or at(state, .LBracket);
+    if (at(state, .DoubleLBracket)) return state.enable_wiki;
+    return at(state, .LBracket);
+}
+
+fn skipCodeSpan(state: *ParserState) bool {
+    const offset = current(state).start_offset;
+    for (state.code_spans) |span| {
+        if (offset >= span.start and offset < span.end) {
+            while (!at(state, .Eof) and current(state).start_offset < span.end) {
+                _ = bump(state);
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 fn parseHeading(state: *ParserState) void {
@@ -308,6 +398,11 @@ fn parseHeading(state: *ParserState) void {
     errdefer state.allocator.free(name);
 
     addSymbol(state, name, protocol.Range{ .start = first_hash.start, .end = end_pos }) catch return;
+    state.headings.append(state.allocator, .{
+        .level = @intCast(level),
+        .text = title,
+        .range = .{ .start = first_hash.start, .end = end_pos },
+    }) catch {};
 }
 
 fn parseLink(state: *ParserState) void {
@@ -315,7 +410,7 @@ fn parseLink(state: *ParserState) void {
     var end_offset = start_tok.end_offset;
     var end_pos = start_tok.end;
 
-    if (at(state, .DoubleLBracket)) {
+    if (at(state, .DoubleLBracket) and state.enable_wiki) {
         _ = bump(state);
         while (!at(state, .Eof) and !at(state, .Newline) and !at(state, .DoubleRBracket)) {
             const tok = bump(state);
@@ -329,11 +424,12 @@ fn parseLink(state: *ParserState) void {
         } else {
             recoverToLineEnd(state);
         }
-        addLinkSymbol(state, start_tok.start_offset, end_offset, start_tok.start, end_pos) catch return;
+        addLinkSymbol(state, .wiki, start_tok.start_offset, end_offset, start_tok.start, end_pos) catch return;
         return;
     }
 
     if (at(state, .LBracket)) {
+        var kind: LinkKind = .reference;
         _ = bump(state);
         while (!at(state, .Eof) and !at(state, .Newline) and !at(state, .RBracket)) {
             const tok = bump(state);
@@ -349,6 +445,7 @@ fn parseLink(state: *ParserState) void {
         end_pos = close_label.end;
 
         if (at(state, .LParen)) {
+            kind = .inline_link;
             _ = bump(state);
             while (!at(state, .Eof) and !at(state, .Newline) and !at(state, .RParen)) {
                 const tok = bump(state);
@@ -378,7 +475,7 @@ fn parseLink(state: *ParserState) void {
             }
         }
 
-        addLinkSymbol(state, start_tok.start_offset, end_offset, start_tok.start, end_pos) catch return;
+        addLinkSymbol(state, kind, start_tok.start_offset, end_offset, start_tok.start, end_pos) catch return;
     }
 }
 
@@ -393,6 +490,7 @@ fn recoverToLineEnd(state: *ParserState) void {
 
 fn addLinkSymbol(
     state: *ParserState,
+    kind: LinkKind,
     start_offset: usize,
     end_offset: usize,
     start_pos: protocol.Position,
@@ -402,7 +500,14 @@ fn addLinkSymbol(
     const slice = state.input[start_offset..end_offset];
     const name = try std.fmt.allocPrint(state.allocator, "Link: {s}", .{slice});
     errdefer state.allocator.free(name);
-    try addSymbol(state, name, protocol.Range{ .start = start_pos, .end = end_pos });
+    const range = protocol.Range{ .start = start_pos, .end = end_pos };
+    try addSymbol(state, name, range);
+    const target = parseLinkTarget(slice, kind);
+    try state.links.append(state.allocator, .{
+        .kind = kind,
+        .target = target,
+        .range = range,
+    });
 }
 
 fn addSymbol(
@@ -435,22 +540,265 @@ fn advanceWithError(state: *ParserState) void {
     _ = bump(state);
 }
 
+fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
+    var spans: std.ArrayList(CodeSpan) = .empty;
+    errdefer spans.deinit(state.allocator);
+
+    var line_iter = std.mem.splitScalar(u8, state.input, '\n');
+    var line_index: usize = 0;
+    var offset: usize = 0;
+
+    var in_code = false;
+    var code_start_line: usize = 0;
+    var code_start_offset: usize = 0;
+    var code_lang: []const u8 = "";
+    var code_start_char: usize = 0;
+
+    var list_active = false;
+    var list_start_line: usize = 0;
+    var list_start_offset: usize = 0;
+    var list_end_line: usize = 0;
+    var list_end_char: usize = 0;
+
+    while (line_iter.next()) |line| : (line_index += 1) {
+        const line_len = line.len;
+        const line_end_offset = offset + line_len;
+
+        if (isCodeFence(line)) |lang| {
+            if (!in_code) {
+                in_code = true;
+                code_start_line = line_index;
+                code_start_offset = offset;
+                code_start_char = 0;
+                code_lang = lang;
+            } else {
+                in_code = false;
+                try addCodeSymbol(
+                    state,
+                    code_lang,
+                    code_start_line,
+                    code_start_char,
+                    line_index,
+                    line_len,
+                );
+                try spans.append(state.allocator, .{ .start = code_start_offset, .end = line_end_offset });
+            }
+
+            offset = line_end_offset + 1;
+            continue;
+        }
+
+        if (in_code) {
+            offset = line_end_offset + 1;
+            continue;
+        }
+
+        if (parseLinkDef(line)) |link_def| {
+            state.link_defs.append(state.allocator, link_def) catch {};
+        }
+
+        if (isListItem(line)) {
+            if (!list_active) {
+                list_active = true;
+                list_start_line = line_index;
+                list_start_offset = offset;
+            }
+            list_end_line = line_index;
+            list_end_char = line_len;
+        } else if (list_active) {
+            try addListSymbol(state, list_start_line, list_end_line, list_end_char);
+            list_active = false;
+        }
+
+        offset = line_end_offset + 1;
+    }
+
+    if (in_code) {
+        const last_line = if (line_index == 0) 0 else line_index - 1;
+        const last_line_len = lastLineLength(state.input);
+        try addCodeSymbol(
+            state,
+            code_lang,
+            code_start_line,
+            code_start_char,
+            last_line,
+            last_line_len,
+        );
+        try spans.append(state.allocator, .{ .start = code_start_offset, .end = state.input.len });
+    }
+
+    if (list_active) {
+        try addListSymbol(state, list_start_line, list_end_line, list_end_char);
+    }
+
+    return spans.toOwnedSlice(state.allocator);
+}
+
+fn isCodeFence(line: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (line.len - i < 3) return null;
+    if (std.mem.startsWith(u8, line[i..], "```")) {
+        const lang = std.mem.trim(u8, line[i + 3 ..], " \t");
+        return lang;
+    }
+    return null;
+}
+
+fn isListItem(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i >= line.len) return false;
+    if (line[i] == '-' and i + 1 < line.len and (line[i + 1] == ' ' or line[i + 1] == '\t')) {
+        return true;
+    }
+    return false;
+}
+
+fn addListSymbol(
+    state: *ParserState,
+    start_line: usize,
+    end_line: usize,
+    end_char: usize,
+) !void {
+    const name = try std.fmt.allocPrint(state.allocator, "List: -", .{});
+    errdefer state.allocator.free(name);
+    try addSymbol(state, name, protocol.Range{
+        .start = .{ .line = start_line, .character = 0 },
+        .end = .{ .line = end_line, .character = end_char },
+    });
+}
+
+fn addCodeSymbol(
+    state: *ParserState,
+    lang: []const u8,
+    start_line: usize,
+    start_char: usize,
+    end_line: usize,
+    end_char: usize,
+) !void {
+    const label = if (lang.len == 0) "(plain)" else lang;
+    const name = try std.fmt.allocPrint(state.allocator, "Code: {s}", .{label});
+    errdefer state.allocator.free(name);
+    try addSymbol(state, name, protocol.Range{
+        .start = .{ .line = start_line, .character = start_char },
+        .end = .{ .line = end_line, .character = end_char },
+    });
+}
+
+fn lastLineLength(text: []const u8) usize {
+    var i: usize = text.len;
+    while (i > 0) : (i -= 1) {
+        if (text[i - 1] == '\n') break;
+    }
+    return text.len - i;
+}
+
+fn parseLinkTarget(slice: []const u8, kind: LinkKind) LinkTarget {
+    switch (kind) {
+        .wiki => {
+            const inner = trimBrackets(slice, "[[", "]]");
+            const parts = splitOnce(inner, '#');
+            return .{
+                .path = if (parts[0].len == 0) null else parts[0],
+                .anchor = if (parts[1].len == 0) null else parts[1],
+                .label = null,
+            };
+        },
+        .inline_link => {
+            const inner = trimBrackets(slice, "[", "]");
+            const paren = std.mem.indexOfScalar(u8, slice, '(') orelse return .{ .path = null, .anchor = null, .label = null };
+            const close = std.mem.lastIndexOfScalar(u8, slice, ')') orelse return .{ .path = null, .anchor = null, .label = null };
+            if (close <= paren + 1) return .{ .path = null, .anchor = null, .label = null };
+            const url = std.mem.trim(u8, slice[paren + 1 .. close], " \t");
+            const parts = splitOnce(url, '#');
+            return .{
+                .path = if (parts[0].len == 0) null else parts[0],
+                .anchor = if (parts[1].len == 0) null else parts[1],
+                .label = inner,
+            };
+        },
+        .reference => {
+            const label = parseReferenceLabel(slice);
+            return .{
+                .path = null,
+                .anchor = null,
+                .label = label,
+            };
+        },
+    }
+}
+
+fn parseReferenceLabel(slice: []const u8) []const u8 {
+    const close = std.mem.indexOfScalar(u8, slice, ']') orelse return "";
+    const rest = slice[close + 1 ..];
+    if (std.mem.startsWith(u8, rest, "[]")) {
+        return slice[1..close];
+    }
+    if (std.mem.startsWith(u8, rest, "[")) {
+        const close_ref = std.mem.indexOfScalar(u8, rest[1..], ']') orelse return slice[1..close];
+        return rest[1 .. 1 + close_ref];
+    }
+    return slice[1..close];
+}
+
+fn trimBrackets(slice: []const u8, open: []const u8, close: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, slice, open)) return slice;
+    if (!std.mem.endsWith(u8, slice, close)) return slice;
+    return slice[open.len .. slice.len - close.len];
+}
+
+fn splitOnce(text: []const u8, needle: u8) [2][]const u8 {
+    if (std.mem.indexOfScalar(u8, text, needle)) |idx| {
+        return .{ text[0..idx], text[idx + 1 ..] };
+    }
+    return .{ text, "" };
+}
+
+fn parseLinkDef(line: []const u8) ?LinkDef {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i >= line.len or line[i] != '[') return null;
+    const close = std.mem.indexOfScalar(u8, line[i + 1 ..], ']') orelse return null;
+    const label = line[i + 1 .. i + 1 + close];
+    const after = line[i + 1 + close + 1 ..];
+    var j: usize = 0;
+    while (j < after.len and (after[j] == ' ' or after[j] == '\t')) : (j += 1) {}
+    if (j >= after.len or after[j] != ':') return null;
+    const url = std.mem.trim(u8, after[j + 1 ..], " \t");
+    if (url.len == 0) return null;
+    const parts = splitOnce(url, '#');
+    return .{
+        .label = label,
+        .target = .{
+            .path = parts[0],
+            .anchor = if (parts[1].len == 0) null else parts[1],
+            .label = label,
+        },
+    };
+}
+
 test "parse simple headings and links" {
     const input =
         \\# Title
+        \\## Subtitle
         \\Text with a [[Wiki Link]] and [Inline](doc.md).
         \\See [Ref][label] too.
     ;
     var parser = Parser{};
-    const symbols = try parser.parse(std.testing.allocator, input);
+    const parsed = try parser.parse(std.testing.allocator, input, true);
     defer {
-        for (symbols) |sym| std.testing.allocator.free(sym.name);
-        std.testing.allocator.free(symbols);
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
     }
 
-    try std.testing.expectEqual(@as(usize, 4), symbols.len);
-    try std.testing.expect(std.mem.startsWith(u8, symbols[0].name, "H1:"));
-    try std.testing.expect(std.mem.startsWith(u8, symbols[1].name, "Link:"));
+    try std.testing.expectEqual(@as(usize, 5), parsed.symbols.len);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.symbols[0].name, "H1:"));
+    try std.testing.expect(std.mem.startsWith(u8, parsed.symbols[1].name, "H2:"));
+    try std.testing.expect(std.mem.startsWith(u8, parsed.symbols[2].name, "Link:"));
 }
 
 test "resilient parsing keeps later headings" {
@@ -460,13 +808,178 @@ test "resilient parsing keeps later headings" {
         \\### Second
     ;
     var parser = Parser{};
-    const symbols = try parser.parse(std.testing.allocator, input);
+    const parsed = try parser.parse(std.testing.allocator, input, true);
     defer {
-        for (symbols) |sym| std.testing.allocator.free(sym.name);
-        std.testing.allocator.free(symbols);
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), symbols.len);
-    try std.testing.expect(std.mem.startsWith(u8, symbols[0].name, "H2: First"));
-    try std.testing.expect(std.mem.startsWith(u8, symbols[1].name, "H3: Second"));
+    try std.testing.expectEqual(@as(usize, 2), parsed.symbols.len);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.symbols[0].name, "H2: First"));
+    try std.testing.expect(std.mem.startsWith(u8, parsed.symbols[1].name, "H3: Second"));
+}
+
+test "list blocks and code fences are symbols" {
+    const input =
+        \\- one
+        \\- two
+        \\text
+        \\```zig
+        \\# not heading
+        \\```
+        \\# Heading
+    ;
+    var parser = Parser{};
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    var list_found = false;
+    var code_found = false;
+    var heading_found = false;
+    for (parsed.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "List: -")) list_found = true;
+        if (std.mem.eql(u8, sym.name, "Code: zig")) code_found = true;
+        if (std.mem.startsWith(u8, sym.name, "H1: Heading")) heading_found = true;
+        if (std.mem.startsWith(u8, sym.name, "H1: not heading")) return error.TestUnexpectedHeading;
+    }
+    try std.testing.expect(list_found);
+    try std.testing.expect(code_found);
+    try std.testing.expect(heading_found);
+}
+
+test "snapshot: mixed markdown symbols" {
+    const input =
+        \\# Title
+        \\- one
+        \\- two
+        \\text
+        \\```zig
+        \\# not heading
+        \\[link](ignored)
+        \\```
+        \\## Subtitle
+        \\Text with a [[Wiki Link]] and [Inline](doc.md).
+        \\See [Ref][label] too.
+    ;
+    var parser = Parser{};
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    const snap = Snap.snap_fn(".");
+    const rendered = try renderSymbols(std.testing.allocator, parsed.symbols);
+    defer std.testing.allocator.free(rendered);
+
+    try snap(@src(),
+        \\H1: Title @ 0:0-0:7
+        \\List: - @ 1:0-2:5
+        \\Code: zig @ 4:0-7:3
+        \\H2: Subtitle @ 8:0-8:11
+        \\Link: [[Wiki Link]] @ 9:10-9:23
+        \\Link: [Inline](doc.md) @ 9:29-9:45
+        \\Link: [Ref][label] @ 10:4-10:16
+    ).diff(rendered);
+}
+
+test "fuzz: parser stays in bounds" {
+    const Context = struct {
+        fn testOne(_: @This(), input: []const u8) anyerror!void {
+            const max_len: usize = 2048;
+            const len = @min(input.len, max_len);
+            const buf = try std.testing.allocator.alloc(u8, len);
+            defer std.testing.allocator.free(buf);
+
+            sanitizeInput(buf, input[0..len]);
+
+            var parser = Parser{};
+            const parsed = try parser.parse(std.testing.allocator, buf, true);
+            defer {
+                for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+                std.testing.allocator.free(parsed.symbols);
+                std.testing.allocator.free(parsed.headings);
+                std.testing.allocator.free(parsed.links);
+                std.testing.allocator.free(parsed.link_defs);
+            }
+
+            const line_lengths = try computeLineLengths(std.testing.allocator, buf);
+            defer std.testing.allocator.free(line_lengths);
+
+            for (parsed.symbols) |sym| {
+                try validateRange(sym.range, line_lengths);
+            }
+        }
+    };
+    try std.testing.fuzz(Context{}, Context.testOne, .{});
+}
+
+fn renderSymbols(allocator: std.mem.Allocator, symbols: []const index.Symbol) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (symbols) |sym| {
+        try out.appendSlice(allocator, sym.name);
+        try out.appendSlice(allocator, " @ ");
+        try out.writer(allocator).print(
+            "{d}:{d}-{d}:{d}\n",
+            .{
+                sym.range.start.line,
+                sym.range.start.character,
+                sym.range.end.line,
+                sym.range.end.character,
+            },
+        );
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn sanitizeInput(dst: []u8, src: []const u8) void {
+    for (src, 0..) |ch, i| {
+        if (ch == '\n' or ch == '\t') {
+            dst[i] = ch;
+        } else if (ch < 0x20 or ch == 0x7f) {
+            dst[i] = ' ';
+        } else {
+            dst[i] = ch;
+        }
+    }
+}
+
+fn computeLineLengths(allocator: std.mem.Allocator, text: []const u8) ![]usize {
+    var lengths: std.ArrayListUnmanaged(usize) = .empty;
+    errdefer lengths.deinit(allocator);
+
+    var line_iter = std.mem.splitScalar(u8, text, '\n');
+    while (line_iter.next()) |line| {
+        try lengths.append(allocator, line.len);
+    }
+    if (text.len == 0) {
+        try lengths.append(allocator, 0);
+    }
+    return lengths.toOwnedSlice(allocator);
+}
+
+fn validateRange(range: protocol.Range, line_lengths: []const usize) !void {
+    if (range.start.line >= line_lengths.len) return error.TestRangeOutOfBounds;
+    if (range.end.line >= line_lengths.len) return error.TestRangeOutOfBounds;
+    if (range.start.character > line_lengths[range.start.line]) return error.TestRangeOutOfBounds;
+    if (range.end.character > line_lengths[range.end.line]) return error.TestRangeOutOfBounds;
+    if (range.end.line < range.start.line) return error.TestRangeOutOfBounds;
+    if (range.end.line == range.start.line and range.end.character < range.start.character) {
+        return error.TestRangeOutOfBounds;
+    }
 }

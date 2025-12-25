@@ -49,3 +49,19 @@ fn readLine(allocator: std.mem.Allocator, reader: anytype) !?[]u8 {
     const slice = try line.toOwnedSlice(allocator);
     return @as(?[]u8, slice);
 }
+
+test "writeMessage and readMessage roundtrip" {
+    const payload = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}";
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeMessage(&out.writer, payload);
+    const message = try out.toOwnedSlice();
+    defer std.testing.allocator.free(message);
+
+    var reader = std.Io.Reader.fixed(message);
+    const parsed = try readMessage(std.testing.allocator, &reader) orelse unreachable;
+    defer std.testing.allocator.free(parsed);
+
+    try std.testing.expectEqualSlices(u8, payload, parsed);
+}
