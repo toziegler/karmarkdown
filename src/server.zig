@@ -189,6 +189,24 @@ fn applyInitializationOptions(server: *Server, opts: std.json.Value) !void {
             server.workspace.setWikiLinks(wl.bool);
         }
     }
+    if (opts.object.get("maxFileSize")) |max_size| {
+        if (max_size == .integer and max_size.integer > 0) {
+            server.workspace.setMaxFileSize(@intCast(max_size.integer));
+        }
+    }
+    if (opts.object.get("exclude")) |ex| {
+        if (ex == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer list.deinit(server.allocator);
+            for (ex.array.items) |item| {
+                if (item != .string) continue;
+                try list.append(server.allocator, item.string);
+            }
+            if (list.items.len > 0) {
+                try server.workspace.setExcludes(list.items);
+            }
+        }
+    }
 }
 
 fn sendNullResult(writer: anytype, root: std.json.Value) !void {
@@ -1190,6 +1208,9 @@ test "initialize options apply extensions and wiki settings" {
 
     try tmp.dir.writeFile(.{ .sub_path = "doc.txt", .data = "# Title\n" });
     try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "# Skip\n" });
+    try tmp.dir.makeDir("skip");
+    try tmp.dir.writeFile(.{ .sub_path = "skip/ignore.txt", .data = "# Ignore\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "big.txt", .data = "# Too big\n" });
     const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root_path);
 
@@ -1201,6 +1222,10 @@ test "initialize options apply extensions and wiki settings" {
     try exts.append(std.json.Value{ .string = ".txt" });
     try opts.put("extensions", std.json.Value{ .array = exts });
     try opts.put("wikiLinks", std.json.Value{ .bool = false });
+    try opts.put("maxFileSize", std.json.Value{ .integer = 8 });
+    var exclude = std.json.Array.init(std.testing.allocator);
+    try exclude.append(std.json.Value{ .string = "skip" });
+    try opts.put("exclude", std.json.Value{ .array = exclude });
 
     var params = std.json.ObjectMap.init(std.testing.allocator);
     try params.put("rootUri", std.json.Value{ .string = root_uri });

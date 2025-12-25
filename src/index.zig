@@ -5,6 +5,8 @@ const parser = @import("parser.zig");
 pub const Config = struct {
     extensions: std.ArrayListUnmanaged([]const u8),
     wiki_links: bool,
+    max_file_size_bytes: usize,
+    excludes: std.ArrayListUnmanaged([]const u8),
 };
 
 pub const Symbol = struct {
@@ -68,6 +70,8 @@ pub const Workspace = struct {
             .config = .{
                 .extensions = ext_list,
                 .wiki_links = true,
+                .max_file_size_bytes = 2 * 1024 * 1024,
+                .excludes = .empty,
             },
             .roots = .empty,
         };
@@ -82,6 +86,7 @@ pub const Workspace = struct {
         self.docs.deinit();
         self.clearRoots();
         self.clearExtensions();
+        self.clearExcludes();
     }
 
     pub fn upsertDocument(self: *Workspace, uri: []const u8, text: []const u8) !void {
@@ -144,6 +149,18 @@ pub const Workspace = struct {
         self.config.wiki_links = enabled;
     }
 
+    pub fn setMaxFileSize(self: *Workspace, bytes: usize) void {
+        self.config.max_file_size_bytes = bytes;
+    }
+
+    pub fn setExcludes(self: *Workspace, excludes: []const []const u8) !void {
+        self.clearExcludes();
+        for (excludes) |pattern| {
+            const owned = try self.allocator.dupe(u8, pattern);
+            try self.config.excludes.append(self.allocator, owned);
+        }
+    }
+
     fn hasRoot(self: *Workspace, root: []const u8) bool {
         for (self.roots.items) |item| {
             if (std.mem.eql(u8, item, root)) return true;
@@ -165,6 +182,13 @@ pub const Workspace = struct {
         self.config.extensions.deinit(self.allocator);
     }
 
+    fn clearExcludes(self: *Workspace) void {
+        for (self.config.excludes.items) |item| {
+            self.allocator.free(item);
+        }
+        self.config.excludes.deinit(self.allocator);
+    }
+
     fn indexFolder(self: *Workspace, root: []const u8) !void {
         var dir = try std.fs.openDirAbsolute(root, .{ .iterate = true });
         defer dir.close();
@@ -174,14 +198,15 @@ pub const Workspace = struct {
 
         while (try walker.next()) |entry| {
             if (entry.kind != .file) continue;
+            if (isExcluded(entry.path, self.config.excludes.items)) continue;
             if (!hasExtension(entry.path, self.config.extensions.items)) continue;
+            if (!fileWithinSize(entry.path, self.config.max_file_size_bytes)) continue;
             try self.upsertDocumentFromPath(entry.path);
         }
     }
 
     pub fn upsertDocumentFromPath(self: *Workspace, path: []const u8) !void {
-        const max_size = 2 * 1024 * 1024;
-        const text = try std.fs.readFileAlloc(self.allocator, path, max_size);
+        const text = try std.fs.readFileAlloc(self.allocator, path, self.config.max_file_size_bytes);
         defer self.allocator.free(text);
         const uri = try pathToUri(self.allocator, path);
         defer self.allocator.free(uri);
@@ -256,11 +281,53 @@ test "workspace respects configured extensions" {
     try std.testing.expect(ws.docs.count() == 1);
 }
 
+test "workspace excludes patterns and max file size" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("skip");
+    try tmp.dir.writeFile(.{ .sub_path = "skip/ignore.md", .data = "# Skip\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "keep.md", .data = "# Keep\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "big.md", .data = "# Too big\n" });
+
+    var ws = Workspace.init(std.testing.allocator);
+    defer ws.deinit();
+
+    try ws.setExcludes(&.{"skip"});
+    ws.setMaxFileSize(4);
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    try ws.addRoot(root_path);
+    try ws.indexRoots();
+
+    try std.testing.expect(ws.docs.count() == 0);
+
+    ws.setMaxFileSize(1024);
+    try ws.indexRoots();
+    try std.testing.expect(ws.docs.count() == 1);
+}
+
 fn hasExtension(path: []const u8, extensions: []const []const u8) bool {
     for (extensions) |ext| {
         if (std.mem.endsWith(u8, path, ext)) return true;
     }
     return false;
+}
+
+fn isExcluded(path: []const u8, excludes: []const []const u8) bool {
+    for (excludes) |pattern| {
+        if (pattern.len == 0) continue;
+        if (std.mem.containsAtLeast(u8, path, 1, pattern)) return true;
+    }
+    return false;
+}
+
+fn fileWithinSize(path: []const u8, max_bytes: usize) bool {
+    if (max_bytes == 0) return false;
+    const stat = std.fs.cwd().statFile(path) catch return false;
+    return stat.size <= max_bytes;
 }
 
 fn pathToUri(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
