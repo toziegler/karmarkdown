@@ -531,6 +531,10 @@ fn handleCodeAction(server: *Server, writer: anytype, root: std.json.Value) !voi
         }
     }
 
+    if (try buildInsertFootnoteAction(server, doc_opt, range)) |action| {
+        try actions.append(server.allocator, action);
+    }
+
     if (try buildRelatedSectionAction(server, doc_opt)) |action| {
         try actions.append(server.allocator, action);
     }
@@ -2202,6 +2206,46 @@ fn buildInsertNewNoteLinkAction(
     return action;
 }
 
+fn buildInsertFootnoteAction(
+    server: *Server,
+    doc: index.Document,
+    range: protocol.Range,
+) !?[]const u8 {
+    if (!(range.start.line == range.end.line and range.start.character == range.end.character)) return null;
+    const id = try dateIdUtc(server.allocator);
+    defer server.allocator.free(id);
+
+    const anchor = try std.fmt.allocPrint(server.allocator, "[^{s}]", .{id});
+    defer server.allocator.free(anchor);
+
+    const def = try std.fmt.allocPrint(server.allocator, "\n[^{s}]: ", .{id});
+    defer server.allocator.free(def);
+
+    const end_pos = documentEndPosition(doc.text);
+
+    var edits: std.ArrayList(TextEdit) = .empty;
+    defer edits.deinit(server.allocator);
+    try edits.append(server.allocator, .{ .range = range, .new_text = anchor });
+    try edits.append(server.allocator, .{
+        .range = .{ .start = end_pos, .end = end_pos },
+        .new_text = def,
+    });
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(server.allocator);
+    var writer = out.writer(server.allocator);
+    try writer.writeAll("{\"title\":\"Insert footnote\",\"kind\":\"quickfix\",\"edit\":{\"changes\":{");
+    try protocol.writeJsonString(writer, doc.uri);
+    try writer.writeAll(":[");
+    for (edits.items, 0..) |edit, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writeTextEdit(writer, edit);
+    }
+    try writer.writeAll("]}}}");
+    const action = try out.toOwnedSlice(server.allocator);
+    return action;
+}
+
 fn buildRelatedSectionAction(
     server: *Server,
     doc: index.Document,
@@ -3312,6 +3356,43 @@ test "snapshot: code action csv to table" {
     const snap = Snap.snap_fn(".");
     try snap(@src(),
         \\{"jsonrpc":"2.0","id":28,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Name,Age\n\nName,Age\nAlice,30\nBob,40\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"[Name,Age](<snap:ignore>.md)"}]}]}},{"title":"Convert CSV to table","kind":"quickfix","edit":{"changes":{"file:///root/a.md":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"| Name  | Age |\n| ----- | --- |\n| Alice | 30  |\n| Bob   | 40  |\n"}]}}}]}
+    ).diff(payload);
+}
+
+test "snapshot: code action insert footnote" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/a.md", "Line one\n");
+
+    const range = protocol.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 0 },
+    };
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    try params.put("range", try rangeValue(allocator, range));
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 29 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":29,"result":[{"title":"Insert new note link","kind":"refactor","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# <snap:ignore>\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"[<snap:ignore>](<snap:ignore>.md)"}]}]}},{"title":"Insert footnote","kind":"quickfix","edit":{"changes":{"file:///root/a.md":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"[^<snap:ignore>]"},{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"\n[^<snap:ignore>]: "}]}}}]}
     ).diff(payload);
 }
 
