@@ -6,6 +6,7 @@ src/clients/c/lib
 .zig-cache/
 zig-cache/
 zig-out/
+result/
 
 tools/
 # By convention, logs from simulator use .vopr extension.
