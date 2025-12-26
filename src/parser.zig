@@ -87,6 +87,12 @@ const CodeSpan = struct {
     end: usize,
 };
 
+const LineInfo = struct {
+    text: []const u8,
+    offset: usize,
+    end_offset: usize,
+};
+
 const Lexer = struct {
     input: []const u8,
     index: usize,
@@ -380,7 +386,7 @@ fn parseMarker(state: *ParserState) void {
     _ = bump(state);
     const close_tok = if (at(state, .RBracket)) bump(state) else start_tok;
     if (trimmed.len <= 1) return;
-    const name = std.fmt.allocPrint(state.allocator, "Tag: {s}", .{trimmed}) catch return;
+    const name = std.fmt.allocPrint(state.allocator, "ProjectTag: {s}", .{trimmed}) catch return;
     errdefer state.allocator.free(name);
     addSymbol(state, name, protocol.Range{ .start = start_tok.start, .end = close_tok.end }) catch return;
 }
@@ -588,9 +594,20 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
     var spans: std.ArrayList(CodeSpan) = .empty;
     errdefer spans.deinit(state.allocator);
 
+    var lines: std.ArrayList(LineInfo) = .empty;
+    defer lines.deinit(state.allocator);
+
     var line_iter = std.mem.splitScalar(u8, state.input, '\n');
-    var line_index: usize = 0;
     var offset: usize = 0;
+    while (line_iter.next()) |line| {
+        const line_end_offset = offset + line.len;
+        try lines.append(state.allocator, .{
+            .text = line,
+            .offset = offset,
+            .end_offset = line_end_offset,
+        });
+        offset = line_end_offset + 1;
+    }
 
     var in_code = false;
     var code_start_line: usize = 0;
@@ -601,15 +618,17 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
     var frontmatter_done = false;
     var collecting_tags = false;
 
-    while (line_iter.next()) |line| : (line_index += 1) {
+    var line_index: usize = 0;
+    while (line_index < lines.items.len) : (line_index += 1) {
+        const line = lines.items[line_index].text;
         const line_len = line.len;
-        const line_end_offset = offset + line_len;
+        const line_end_offset = lines.items[line_index].end_offset;
 
         if (isCodeFence(line)) |lang| {
             if (!in_code) {
                 in_code = true;
                 code_start_line = line_index;
-                code_start_offset = offset;
+                code_start_offset = lines.items[line_index].offset;
                 code_start_char = 0;
                 code_lang = lang;
             } else {
@@ -625,19 +644,16 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
                 try spans.append(state.allocator, .{ .start = code_start_offset, .end = line_end_offset });
             }
 
-            offset = line_end_offset + 1;
             continue;
         }
 
         if (in_code) {
-            offset = line_end_offset + 1;
             continue;
         }
 
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (!frontmatter_done and line_index == 0 and std.mem.eql(u8, trimmed, "---")) {
             in_frontmatter = true;
-            offset = line_end_offset + 1;
             continue;
         }
 
@@ -645,11 +661,15 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
             if (line_index > 0 and (std.mem.eql(u8, trimmed, "---") or std.mem.eql(u8, trimmed, "..."))) {
                 in_frontmatter = false;
                 frontmatter_done = true;
-                offset = line_end_offset + 1;
                 continue;
             }
             try parseFrontmatterTagsLine(state, line, line_index, &collecting_tags);
-            offset = line_end_offset + 1;
+            continue;
+        }
+
+        if (detectTable(lines.items, line_index)) |table| {
+            try addTableSymbol(state, table.cols, table.rows, line_index, 0, table.end_char);
+            line_index = table.end_line;
             continue;
         }
 
@@ -664,12 +684,10 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
             const item_text = if (info.text.len == 0) "-" else info.text;
             try addListItemSymbol(state, item_text, line_index, info.start_col, line_len);
         }
-
-        offset = line_end_offset + 1;
     }
 
     if (in_code) {
-        const last_line = if (line_index == 0) 0 else line_index - 1;
+        const last_line = if (lines.items.len == 0) 0 else lines.items.len - 1;
         const last_line_len = lastLineLength(state.input);
         try addCodeSymbol(
             state,
@@ -774,6 +792,75 @@ fn listItemInfo(line: []const u8) ?struct {
     return .{ .start_col = i, .text = text };
 }
 
+fn detectTable(lines: []const LineInfo, line_index: usize) ?struct {
+    end_line: usize,
+    end_char: usize,
+    cols: usize,
+    rows: usize,
+} {
+    if (line_index + 1 >= lines.len) return null;
+    const header = lines[line_index].text;
+    const separator = lines[line_index + 1].text;
+    if (!isTableHeader(header)) return null;
+    if (!isTableSeparator(separator)) return null;
+    const cols = countTableColumns(header);
+    if (cols == 0) return null;
+
+    var end_line = line_index + 1;
+    var rows: usize = 0;
+    var idx = line_index + 2;
+    while (idx < lines.len) : (idx += 1) {
+        const line = lines[idx].text;
+        if (!looksLikeTableRow(line)) break;
+        rows += 1;
+        end_line = idx;
+    }
+
+    const end_char = lines[end_line].text.len;
+    return .{ .end_line = end_line, .end_char = end_char, .cols = cols, .rows = rows };
+}
+
+fn isTableHeader(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return false;
+    return std.mem.indexOfScalar(u8, trimmed, '|') != null;
+}
+
+fn looksLikeTableRow(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return false;
+    return std.mem.indexOfScalar(u8, trimmed, '|') != null;
+}
+
+fn isTableSeparator(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, trimmed, '|') == null) return false;
+    var has_dash = false;
+    for (trimmed) |ch| {
+        switch (ch) {
+            '-' => {
+                has_dash = true;
+            },
+            ':', '|', ' ', '\t' => {},
+            else => return false,
+        }
+    }
+    return has_dash;
+}
+
+fn countTableColumns(line: []const u8) usize {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, trimmed, '|');
+    while (it.next()) |part| {
+        const cell = std.mem.trim(u8, part, " \t");
+        if (cell.len == 0) continue;
+        count += 1;
+    }
+    return count;
+}
+
 fn addListItemSymbol(
     state: *ParserState,
     text: []const u8,
@@ -792,6 +879,22 @@ fn addListItemSymbol(
     try addSymbol(state, name, protocol.Range{
         .start = .{ .line = line, .character = start_char },
         .end = .{ .line = line, .character = end_char },
+    });
+}
+
+fn addTableSymbol(
+    state: *ParserState,
+    cols: usize,
+    rows: usize,
+    start_line: usize,
+    start_char: usize,
+    end_char: usize,
+) !void {
+    const name = try std.fmt.allocPrint(state.allocator, "Table: {d}x{d}", .{ rows, cols });
+    errdefer state.allocator.free(name);
+    try addSymbol(state, name, protocol.Range{
+        .start = .{ .line = start_line, .character = start_char },
+        .end = .{ .line = start_line + 1 + rows, .character = end_char },
     });
 }
 
@@ -1095,6 +1198,30 @@ test "reference link definitions are symbols" {
     try std.testing.expect(found);
 }
 
+test "tables are symbols" {
+    const input =
+        \\| Name | Age |
+        \\| --- | --- |
+        \\| Alice | 30 |
+        \\Text
+    ;
+    var parser = Parser{};
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    var table_found = false;
+    for (parsed.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "Table: 1x2")) table_found = true;
+    }
+    try std.testing.expect(table_found);
+}
+
 test "tags are symbols" {
     const input =
         \\---
@@ -1154,10 +1281,10 @@ test "custom markers are symbols" {
     var dev_found = false;
     var link_found = false;
     for (parsed.symbols) |sym| {
-        if (std.mem.eql(u8, sym.name, "Tag: @blog")) blog_found = true;
-        if (std.mem.eql(u8, sym.name, "Tag: @Dev")) dev_found = true;
+        if (std.mem.eql(u8, sym.name, "ProjectTag: @blog")) blog_found = true;
+        if (std.mem.eql(u8, sym.name, "ProjectTag: @Dev")) dev_found = true;
         if (std.mem.startsWith(u8, sym.name, "Link: [@link]")) link_found = true;
-        if (std.mem.eql(u8, sym.name, "Tag: @skip")) return error.TestUnexpectedTag;
+        if (std.mem.eql(u8, sym.name, "ProjectTag: @skip")) return error.TestUnexpectedTag;
     }
     try std.testing.expect(blog_found);
     try std.testing.expect(dev_found);

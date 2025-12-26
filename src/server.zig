@@ -516,6 +516,10 @@ fn handleCodeAction(server: *Server, writer: anytype, root: std.json.Value) !voi
         try actions.append(server.allocator, action);
     }
 
+    if (try buildCsvToTableAction(server, doc_opt, range)) |action| {
+        try actions.append(server.allocator, action);
+    }
+
     if (range.start.line == range.end.line and range.start.character == range.end.character) {
         if (try buildInsertNewNoteLinkAction(server, doc_opt, range)) |action| {
             try actions.append(server.allocator, action);
@@ -1337,9 +1341,11 @@ fn isDocSymbolEntry(sym: index.Symbol, headings: []parser.Heading) bool {
     const is_code = std.mem.startsWith(u8, sym.name, "Code:");
     const is_link = std.mem.startsWith(u8, sym.name, "Link:");
     const is_ref = std.mem.startsWith(u8, sym.name, "Ref:");
-    const is_tag = std.mem.startsWith(u8, sym.name, "Tag:");
+    const is_table = std.mem.startsWith(u8, sym.name, "Table:");
+    const is_tag = std.mem.startsWith(u8, sym.name, "Tag:") or
+        std.mem.startsWith(u8, sym.name, "ProjectTag:");
     const is_task = std.mem.startsWith(u8, sym.name, "Task:");
-    if (!is_list and !is_code and !is_link and !is_ref and !is_tag and !is_task) return false;
+    if (!is_list and !is_code and !is_link and !is_ref and !is_table and !is_tag and !is_task) return false;
     for (headings) |heading| {
         if (rangeEqual(sym.range, heading.range)) return false;
     }
@@ -2064,6 +2070,32 @@ fn buildExtractSelectionAction(
     return action;
 }
 
+fn buildCsvToTableAction(
+    server: *Server,
+    doc: index.Document,
+    range: protocol.Range,
+) !?[]const u8 {
+    if (range.start.line == range.end.line and range.start.character == range.end.character) return null;
+    const selection = sliceForRange(doc.text, range);
+    if (std.mem.trim(u8, selection, " \t\r\n").len == 0) return null;
+    if (std.mem.indexOfScalar(u8, selection, ',') == null) return null;
+
+    const table = try parseCsvTable(server.allocator, selection) orelse return null;
+    defer freeCsvTable(server.allocator, table);
+
+    const markdown = try renderCsvTable(server.allocator, table);
+    defer server.allocator.free(markdown);
+
+    const action = try buildReplaceAction(
+        server.allocator,
+        doc.uri,
+        range,
+        markdown,
+        "Convert CSV to table",
+    );
+    return action;
+}
+
 fn buildInsertNewNoteLinkAction(
     server: *Server,
     doc: index.Document,
@@ -2196,7 +2228,7 @@ fn buildReplaceAction(
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    const writer = out.writer(allocator);
     try writer.writeAll("{\"title\":");
     try protocol.writeJsonString(writer, title);
     try writer.writeAll(",\"kind\":\"quickfix\",\"edit\":{\"changes\":{");
@@ -2312,6 +2344,202 @@ fn selectionTitle(text: []const u8) []const u8 {
     return "Note";
 }
 
+const CsvRow = struct {
+    fields: []const []const u8,
+};
+
+const CsvTable = struct {
+    rows: []const CsvRow,
+};
+
+fn parseCsvTable(allocator: std.mem.Allocator, text: []const u8) !?CsvTable {
+    var rows: std.ArrayListUnmanaged(CsvRow) = .empty;
+    errdefer {
+        for (rows.items) |row| {
+            for (row.fields) |field| allocator.free(field);
+            allocator.free(row.fields);
+        }
+        rows.deinit(allocator);
+    }
+
+    var line_iter = std.mem.splitScalar(u8, text, '\n');
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const line_no_cr = std.mem.trimRight(u8, line, "\r");
+        const fields = try parseCsvLine(allocator, line_no_cr);
+        try rows.append(allocator, .{ .fields = fields });
+    }
+
+    if (rows.items.len == 0) return null;
+    return CsvTable{ .rows = try rows.toOwnedSlice(allocator) };
+}
+
+fn parseCsvLine(allocator: std.mem.Allocator, line: []const u8) ![]const []const u8 {
+    var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (fields.items) |field| allocator.free(field);
+        fields.deinit(allocator);
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    var in_quotes = false;
+    var quoted_field = false;
+    var i: usize = 0;
+    while (i <= line.len) : (i += 1) {
+        const at_end = i == line.len;
+        const ch = if (at_end) 0 else line[i];
+        if (at_end or (!in_quotes and ch == ',')) {
+            const raw = buf.items;
+            const field_text = if (quoted_field)
+                raw
+            else
+                std.mem.trim(u8, raw, " \t");
+            const field = try allocator.dupe(u8, field_text);
+            try fields.append(allocator, field);
+            buf.clearRetainingCapacity();
+            quoted_field = false;
+            continue;
+        }
+
+        if (ch == '"' and !in_quotes) {
+            in_quotes = true;
+            quoted_field = true;
+            continue;
+        }
+
+        if (ch == '"' and in_quotes) {
+            if (i + 1 < line.len and line[i + 1] == '"') {
+                try buf.append(allocator, '"');
+                i += 1;
+            } else {
+                in_quotes = false;
+            }
+            continue;
+        }
+
+        try buf.append(allocator, ch);
+    }
+
+    return fields.toOwnedSlice(allocator);
+}
+
+fn freeCsvTable(allocator: std.mem.Allocator, table: CsvTable) void {
+    for (table.rows) |row| {
+        for (row.fields) |field| allocator.free(field);
+        allocator.free(row.fields);
+    }
+    allocator.free(table.rows);
+}
+
+fn renderCsvTable(allocator: std.mem.Allocator, table: CsvTable) ![]u8 {
+    var max_cols: usize = 0;
+    for (table.rows) |row| {
+        if (row.fields.len > max_cols) max_cols = row.fields.len;
+    }
+    if (max_cols == 0) return allocator.dupe(u8, "");
+
+    var widths = try allocator.alloc(usize, max_cols);
+    defer allocator.free(widths);
+    @memset(widths, 0);
+
+    for (table.rows) |row| {
+        var col: usize = 0;
+        while (col < max_cols) : (col += 1) {
+            const text = if (col < row.fields.len) row.fields[col] else "";
+            const width = cellDisplayWidth(text);
+            if (width > widths[col]) widths[col] = width;
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const writer = out.writer(allocator);
+
+    try writeTableRow(allocator, writer, table.rows[0], widths);
+    try writeTableSeparator(writer, widths);
+    var idx: usize = 1;
+    while (idx < table.rows.len) : (idx += 1) {
+        try writeTableRow(allocator, writer, table.rows[idx], widths);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeTableRow(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    row: CsvRow,
+    widths: []const usize,
+) !void {
+    try writer.writeByte('|');
+    var col: usize = 0;
+    while (col < widths.len) : (col += 1) {
+        const text = if (col < row.fields.len) row.fields[col] else "";
+        const width = cellDisplayWidth(text);
+        try writer.writeByte(' ');
+        try writeEscapedCell(allocator, writer, text);
+        if (width < widths[col]) {
+            try writeSpaces(writer, widths[col] - width);
+        }
+        try writer.writeAll(" |");
+    }
+    try writer.writeByte('\n');
+}
+
+fn writeTableSeparator(writer: anytype, widths: []const usize) !void {
+    try writer.writeByte('|');
+    var col: usize = 0;
+    while (col < widths.len) : (col += 1) {
+        const dash_count = if (widths[col] < 3) 3 else widths[col];
+        try writer.writeByte(' ');
+        try writeDashes(writer, dash_count);
+        try writer.writeAll(" |");
+    }
+    try writer.writeByte('\n');
+}
+
+fn writeEscapedCell(allocator: std.mem.Allocator, writer: anytype, text: []const u8) !void {
+    _ = allocator;
+    for (text) |ch| {
+        switch (ch) {
+            '|' => try writer.writeAll("\\|"),
+            '\n' => try writer.writeByte(' '),
+            '\r' => {},
+            else => try writer.writeByte(ch),
+        }
+    }
+}
+
+fn cellDisplayWidth(text: []const u8) usize {
+    var width: usize = 0;
+    for (text) |ch| {
+        switch (ch) {
+            '|' => width += 2,
+            '\r' => {},
+            '\n' => width += 1,
+            else => width += 1,
+        }
+    }
+    return width;
+}
+
+fn writeSpaces(writer: anytype, count: usize) !void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        try writer.writeByte(' ');
+    }
+}
+
+fn writeDashes(writer: anytype, count: usize) !void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        try writer.writeByte('-');
+    }
+}
+
 fn documentEndPosition(text: []const u8) protocol.Position {
     var line: usize = 0;
     var col: usize = 0;
@@ -2340,8 +2568,13 @@ fn collectTags(allocator: std.mem.Allocator, doc: index.Document) ![]const []con
         tags.deinit(allocator);
     }
     for (doc.symbols) |sym| {
-        if (!std.mem.startsWith(u8, sym.name, "Tag: ")) continue;
-        const raw = sym.name["Tag: ".len..];
+        const prefix = if (std.mem.startsWith(u8, sym.name, "Tag: "))
+            "Tag: "
+        else if (std.mem.startsWith(u8, sym.name, "ProjectTag: "))
+            "ProjectTag: "
+        else
+            continue;
+        const raw = sym.name[prefix.len..];
         const lower = try lowerAlloc(allocator, raw);
         try tags.append(allocator, lower);
     }
@@ -2362,8 +2595,13 @@ fn relatedScore(allocator: std.mem.Allocator, tags: []const []const u8, doc: ind
             _ = tag_set.put(tag, {}) catch {};
         }
         for (doc.symbols) |sym| {
-            if (!std.mem.startsWith(u8, sym.name, "Tag: ")) continue;
-            const raw = sym.name["Tag: ".len..];
+            const prefix = if (std.mem.startsWith(u8, sym.name, "Tag: "))
+                "Tag: "
+            else if (std.mem.startsWith(u8, sym.name, "ProjectTag: "))
+                "ProjectTag: "
+            else
+                continue;
+            const raw = sym.name[prefix.len..];
             const lower = lowerAlloc(allocator, raw) catch continue;
             defer allocator.free(lower);
             if (tag_set.contains(lower)) score += 2;
@@ -2988,6 +3226,43 @@ test "snapshot: code action extract selection" {
     const snap = Snap.snap_fn(".");
     try snap(@src(),
         \\{"jsonrpc":"2.0","id":23,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Line one\n\nLine one\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"[Line one](<snap:ignore>.md)"}]}]}}]}
+    ).diff(payload);
+}
+
+test "snapshot: code action csv to table" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/a.md", "Name,Age\nAlice,30\nBob,40\n");
+
+    const range = protocol.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 2, .character = 6 },
+    };
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    try params.put("range", try rangeValue(allocator, range));
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 28 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":28,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Name,Age\n\nName,Age\nAlice,30\nBob,40\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"[Name,Age](<snap:ignore>.md)"}]}]}},{"title":"Convert CSV to table","kind":"quickfix","edit":{"changes":{"file:///root/a.md":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"| Name  | Age |\n| ----- | --- |\n| Alice | 30  |\n| Bob   | 40  |\n"}]}}}]}
     ).diff(payload);
 }
 
