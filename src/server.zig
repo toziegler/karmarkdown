@@ -2337,6 +2337,40 @@ test "code action creates missing note" {
     try std.testing.expect(result_val.array.items.len > 0);
 }
 
+test "snapshot: code action create note" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/doc.md", "[Missing](missing.md)\n");
+    const doc = server.workspace.getDocument("file:///root/doc.md").?;
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/doc.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    const range = try rangeValue(allocator, doc.links[0].range);
+    try params.put("range", range);
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 20 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":20,"result":[{"title":"Create note: Missing","kind":"quickfix","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/missing.md"},{"textDocument":{"uri":"file:///root/missing.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Missing\n"}]}]}}]}
+    ).diff(payload);
+}
+
 test "code action fixes broken link" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator);
@@ -2371,6 +2405,41 @@ test "code action fixes broken link" {
     const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
     if (result_val != .array) return error.TestExpectedArray;
     try std.testing.expect(result_val.array.items.len > 0);
+}
+
+test "snapshot: code action fix broken link" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/doc.md", "[Note](missing.md)\n");
+    try server.workspace.upsertDocument("file:///root/notes.md", "# Notes\n");
+    const doc = server.workspace.getDocument("file:///root/doc.md").?;
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/doc.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    const range = try rangeValue(allocator, doc.links[0].range);
+    try params.put("range", range);
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 21 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":21,"result":[{"title":"Fix link -> notes","kind":"quickfix","edit":{"changes":{"file:///root/doc.md":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":18}},"newText":"[Note](notes.md)"}]}}}]}
+    ).diff(payload);
 }
 
 test "code action renames note and updates links" {
@@ -2409,6 +2478,41 @@ test "code action renames note and updates links" {
     try std.testing.expect(result_val.array.items.len > 0);
 }
 
+test "snapshot: code action rename note" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/a.md", "# Alpha\n");
+    try server.workspace.upsertDocument("file:///root/b.md", "[link](a.md)\n");
+    const doc = server.workspace.getDocument("file:///root/a.md").?;
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    const range = try rangeValue(allocator, doc.headings[0].range);
+    try params.put("range", range);
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 22 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":22,"result":[{"title":"Rename note to Alpha","kind":"refactor","edit":{"documentChanges":[{"kind":"rename","oldUri":"file:///root/a.md","newUri":"file:///root/alpha.md"},{"textDocument":{"uri":"file:///root/b.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":12}},"newText":"[link](alpha.md)"}]}]}}]}
+    ).diff(payload);
+}
+
 test "code action extracts selection" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator);
@@ -2445,6 +2549,43 @@ test "code action extracts selection" {
     const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
     if (result_val != .array) return error.TestExpectedArray;
     try std.testing.expect(result_val.array.items.len > 0);
+}
+
+test "snapshot: code action extract selection" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/a.md", "Line one\nLine two\n");
+
+    const range = protocol.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 8 },
+    };
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    try params.put("range", try rangeValue(allocator, range));
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 23 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\{"jsonrpc":"2.0","id":23,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/line-one.md"},{"textDocument":{"uri":"file:///root/line-one.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Line one\n\nLine one\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"[Line one](line-one.md)"}]}]}}]}
+    ).diff(payload);
 }
 
 test "workspace symbol indexes new files on demand" {
