@@ -270,6 +270,7 @@ const ParserState = struct {
     index: usize,
     symbols: std.ArrayList(index.Symbol),
     code_spans: []CodeSpan,
+    inline_spans: []CodeSpan,
     headings: std.ArrayList(Heading),
     links: std.ArrayList(Link),
     link_defs: std.ArrayList(LinkDef),
@@ -294,6 +295,7 @@ fn parseSimple(allocator: std.mem.Allocator, text: []const u8, enable_wiki: bool
         .index = 0,
         .symbols = .empty,
         .code_spans = &.{},
+        .inline_spans = &.{},
         .headings = .empty,
         .links = .empty,
         .link_defs = .empty,
@@ -310,6 +312,10 @@ fn parseSimple(allocator: std.mem.Allocator, text: []const u8, enable_wiki: bool
     const code_spans = try parseBlocksFromLines(&state);
     defer allocator.free(code_spans);
     state.code_spans = code_spans;
+
+    const inline_spans = try parseInlineCodeSpans(text, allocator);
+    defer allocator.free(inline_spans);
+    state.inline_spans = inline_spans;
 
     parseFile(&state);
     return .{
@@ -352,6 +358,14 @@ fn atLinkStart(state: *ParserState) bool {
 fn skipCodeSpan(state: *ParserState) bool {
     const offset = current(state).start_offset;
     for (state.code_spans) |span| {
+        if (offset >= span.start and offset < span.end) {
+            while (!at(state, .Eof) and current(state).start_offset < span.end) {
+                _ = bump(state);
+            }
+            return true;
+        }
+    }
+    for (state.inline_spans) |span| {
         if (offset >= span.start and offset < span.end) {
             while (!at(state, .Eof) and current(state).start_offset < span.end) {
                 _ = bump(state);
@@ -634,6 +648,46 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
     return spans.toOwnedSlice(state.allocator);
 }
 
+fn parseInlineCodeSpans(input: []const u8, allocator: std.mem.Allocator) ![]CodeSpan {
+    var spans: std.ArrayList(CodeSpan) = .empty;
+    errdefer spans.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] != '`') {
+            i += 1;
+            continue;
+        }
+
+        var tick_len: usize = 1;
+        while (i + tick_len < input.len and input[i + tick_len] == '`') : (tick_len += 1) {}
+        const start = i;
+
+        var j = i + tick_len;
+        while (j < input.len and input[j] != '\n') {
+            if (input[j] == '`') {
+                var run: usize = 1;
+                while (j + run < input.len and input[j + run] == '`') : (run += 1) {}
+                if (run == tick_len) {
+                    const end = j + run;
+                    try spans.append(allocator, .{ .start = start, .end = end });
+                    i = end;
+                    break;
+                }
+                j += run;
+                continue;
+            }
+            j += 1;
+        }
+
+        if (j >= input.len or input[j] == '\n') {
+            i += tick_len;
+        }
+    }
+
+    return spans.toOwnedSlice(allocator);
+}
+
 fn isCodeFence(line: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
@@ -854,6 +908,22 @@ test "list blocks and code fences are symbols" {
     try std.testing.expect(list_found);
     try std.testing.expect(code_found);
     try std.testing.expect(heading_found);
+}
+
+test "inline code spans suppress links" {
+    var parser = Parser{};
+    const input = "`[skip](a.md)` [ok](b.md)\n";
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.links.len);
+    try std.testing.expect(std.mem.containsAtLeast(u8, parsed.symbols[0].name, 1, "ok"));
 }
 
 test "snapshot: mixed markdown symbols" {
