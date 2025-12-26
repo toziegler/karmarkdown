@@ -498,6 +498,14 @@ fn handleCodeAction(server: *Server, writer: anytype, root: std.json.Value) !voi
         if (try buildCreateNoteAction(server, doc_opt, link)) |action| {
             try actions.append(server.allocator, action);
         }
+        const fix_actions = try buildFixLinkActions(server, doc_opt, link);
+        defer {
+            for (fix_actions) |item| server.allocator.free(item);
+            server.allocator.free(fix_actions);
+        }
+        for (fix_actions) |item| {
+            try actions.append(server.allocator, item);
+        }
     }
 
     try sendCodeActionResult(writer, root, actions.items);
@@ -1787,6 +1795,152 @@ fn buildCreateNoteAction(
     return out.toOwnedSlice(server.allocator);
 }
 
+fn buildFixLinkActions(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) ![]const []const u8 {
+    if (try analyzeLink(server, doc, link) != .missing_target) return &.{};
+    const target = resolveLinkTarget(server, doc, link) orelse return &.{};
+    if (target.path == null) return &.{};
+
+    const key_raw = normalizeTargetKey(target.path.?);
+    if (key_raw.len == 0) return &.{};
+    const key = try lowerAlloc(server.allocator, key_raw);
+    defer server.allocator.free(key);
+
+    var candidates: std.ArrayListUnmanaged(struct {
+        uri: []const u8,
+        score: usize,
+    }) = .empty;
+    defer candidates.deinit(server.allocator);
+
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        const base = uriBaseName(server.allocator, entry.key_ptr.*) orelse continue;
+        defer server.allocator.free(base);
+        const base_lower = try lowerAlloc(server.allocator, base);
+        defer server.allocator.free(base_lower);
+        const score = candidateScore(key, base_lower);
+        if (score == 0) continue;
+        candidates.append(server.allocator, .{ .uri = entry.key_ptr.*, .score = score }) catch {};
+    }
+
+    if (candidates.items.len == 0) return &.{};
+    std.sort.heap(@TypeOf(candidates.items[0]), candidates.items, {}, struct {
+        fn lessThan(_: void, a: @TypeOf(candidates.items[0]), b: @TypeOf(candidates.items[0])) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    const limit = @min(candidates.items.len, 3);
+    var actions: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (actions.items) |item| server.allocator.free(item);
+        actions.deinit(server.allocator);
+    }
+
+    var idx: usize = 0;
+    while (idx < limit) : (idx += 1) {
+        const candidate_uri = candidates.items[idx].uri;
+        const replacement = try buildLinkReplacement(server, doc, link, candidate_uri);
+        defer server.allocator.free(replacement);
+
+        const candidate_name = basenameFromUri(server.allocator, candidate_uri) orelse null;
+        defer if (candidate_name) |name| server.allocator.free(name);
+        const title = try std.fmt.allocPrint(
+            server.allocator,
+            "Fix link -> {s}",
+            .{candidate_name orelse "note"},
+        );
+        defer server.allocator.free(title);
+
+        const action = try buildReplaceAction(server.allocator, doc.uri, link.range, replacement, title);
+        try actions.append(server.allocator, action);
+    }
+
+    return actions.toOwnedSlice(server.allocator);
+}
+
+fn buildReplaceAction(
+    allocator: std.mem.Allocator,
+    uri: []const u8,
+    range: protocol.Range,
+    new_text: []const u8,
+    title: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var writer = out.writer(allocator);
+    try writer.writeAll("{\"title\":");
+    try protocol.writeJsonString(writer, title);
+    try writer.writeAll(",\"kind\":\"quickfix\",\"edit\":{\"changes\":{");
+    try protocol.writeJsonString(writer, uri);
+    try writer.writeAll(":[");
+    try writeTextEdit(writer, .{ .range = range, .new_text = new_text });
+    try writer.writeAll("]}}}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn normalizeTargetKey(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    return stripExtension(base);
+}
+
+fn uriBaseName(allocator: std.mem.Allocator, uri: []const u8) ?[]u8 {
+    const path = uriToPath(allocator, uri) orelse return null;
+    defer allocator.free(path);
+    const base = stripExtension(std.fs.path.basename(path));
+    return allocator.dupe(u8, base) catch null;
+}
+
+fn candidateScore(target: []const u8, candidate: []const u8) usize {
+    if (std.mem.eql(u8, target, candidate)) return 100;
+    if (std.mem.containsAtLeast(u8, candidate, 1, target)) return 50;
+    if (search.isSubsequence(target, candidate)) return 10;
+    return 0;
+}
+
+fn lowerAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, text.len);
+    for (text, 0..) |ch, i| {
+        out[i] = lowerAscii(ch);
+    }
+    return out;
+}
+
+fn buildLinkReplacement(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+    target_uri: []const u8,
+) ![]u8 {
+    const base = basenameFromUri(server.allocator, target_uri) orelse return error.MissingTarget;
+    defer server.allocator.free(base);
+
+    if (link.kind == .wiki) {
+        return std.fmt.allocPrint(server.allocator, "[[{s}]]", .{base});
+    }
+
+    const label = link.target.label orelse base;
+    const rel = try relativePath(server.allocator, doc.uri, target_uri);
+    defer server.allocator.free(rel);
+    return std.fmt.allocPrint(server.allocator, "[{s}]({s})", .{ label, rel });
+}
+
+fn basenameFromUri(allocator: std.mem.Allocator, uri: []const u8) ?[]u8 {
+    return uriBaseName(allocator, uri);
+}
+
+fn relativePath(allocator: std.mem.Allocator, from_uri: []const u8, to_uri: []const u8) ![]u8 {
+    const from_path = uriToPath(allocator, from_uri) orelse return error.InvalidUri;
+    defer allocator.free(from_path);
+    const to_path = uriToPath(allocator, to_uri) orelse return error.InvalidUri;
+    defer allocator.free(to_path);
+    const from_dir = std.fs.path.dirname(from_path) orelse from_path;
+    return std.fs.path.relative(allocator, from_dir, to_path);
+}
+
 fn pathToUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "file://{s}", .{path});
 }
@@ -1943,6 +2097,42 @@ test "code action creates missing note" {
 
     var root_obj = std.json.ObjectMap.init(allocator);
     try root_obj.put("id", std.json.Value{ .integer = 10 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    try std.testing.expect(result_val.array.items.len > 0);
+}
+
+test "code action fixes broken link" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/doc.md", "[Note](missing.md)\n");
+    try server.workspace.upsertDocument("file:///root/notes.md", "# Notes\n");
+    const doc = server.workspace.getDocument("file:///root/doc.md").?;
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/doc.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    const range = try rangeValue(allocator, doc.links[0].range);
+    try params.put("range", range);
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 11 });
     try root_obj.put("params", std.json.Value{ .object = params });
     const root = std.json.Value{ .object = root_obj };
     defer deinitValue(allocator, root);
