@@ -683,7 +683,7 @@ fn publishDiagnostics(
         try out.print("{d}", .{diag.range.end.character});
         try out.writeAll("}},\"severity\":");
         try out.print("{d}", .{diag.severity});
-        try out.writeAll(",\"source\":\"huntsman\",\"message\":");
+        try out.writeAll(",\"source\":\"karmarkdown\",\"message\":");
         try protocol.writeJsonString(out, diag.message);
         try out.writeAll("}");
     }

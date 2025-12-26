@@ -29,8 +29,8 @@ vim.api.nvim_create_autocmd("FileType", {
   pattern = "markdown",
   callback = function()
     vim.lsp.start({
-      name = "huntsman",
-      cmd = { "/tmp/huntsman/zig-out/bin/huntsman" },
+      name = "karmarkdown",
+      cmd = { "/tmp/huntsman/zig-out/bin/karmarkdown" },
       root_dir = vim.fn.getcwd(),
     })
   end,

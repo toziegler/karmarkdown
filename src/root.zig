@@ -1,4 +1,4 @@
-//! Core library entry point for Huntsman.
+//! Core library entry point for Karmarkdown.
 pub const protocol = @import("protocol.zig");
 pub const index = @import("index.zig");
 pub const parser = @import("parser.zig");
