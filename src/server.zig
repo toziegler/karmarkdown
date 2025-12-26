@@ -1199,7 +1199,8 @@ fn isDocSymbolEntry(sym: index.Symbol, headings: []parser.Heading) bool {
     const is_link = std.mem.startsWith(u8, sym.name, "Link:");
     const is_ref = std.mem.startsWith(u8, sym.name, "Ref:");
     const is_tag = std.mem.startsWith(u8, sym.name, "Tag:");
-    if (!is_list and !is_code and !is_link and !is_ref and !is_tag) return false;
+    const is_task = std.mem.startsWith(u8, sym.name, "Task:");
+    if (!is_list and !is_code and !is_link and !is_ref and !is_tag and !is_task) return false;
     for (headings) |heading| {
         if (rangeEqual(sym.range, heading.range)) return false;
     }
@@ -1207,7 +1208,7 @@ fn isDocSymbolEntry(sym: index.Symbol, headings: []parser.Heading) bool {
 }
 
 fn isListItemSymbol(sym: index.Symbol) bool {
-    return std.mem.startsWith(u8, sym.name, "List:");
+    return std.mem.startsWith(u8, sym.name, "List:") or std.mem.startsWith(u8, sym.name, "Task:");
 }
 
 fn listItemIndent(text: []const u8, line: usize) usize {
@@ -1872,7 +1873,7 @@ test "snapshot: document symbol hierarchy" {
         \\
         \\- [item](doc.md)
         \\  - child
-        \\- item2
+        \\- [ ] todo
         \\
         \\```zig
         \\let x = 1;
@@ -1894,7 +1895,7 @@ test "snapshot: document symbol hierarchy" {
         \\H1: Title
         \\  List: [item](doc.md)
         \\    List: child
-        \\  List: item2
+        \\  Task: [ ] todo
         \\  Link: [item](doc.md)
         \\  Code: zig
         \\  H2: Sub

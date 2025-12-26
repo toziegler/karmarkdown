@@ -731,12 +731,28 @@ fn addListItemSymbol(
     start_char: usize,
     end_char: usize,
 ) !void {
-    const name = try std.fmt.allocPrint(state.allocator, "List: {s}", .{text});
+    const name = if (parseTask(text)) |task|
+        if (task.rest.len > 0)
+            try std.fmt.allocPrint(state.allocator, "Task: {s} {s}", .{ task.status, task.rest })
+        else
+            try std.fmt.allocPrint(state.allocator, "Task: {s}", .{task.status})
+    else
+        try std.fmt.allocPrint(state.allocator, "List: {s}", .{text});
     errdefer state.allocator.free(name);
     try addSymbol(state, name, protocol.Range{
         .start = .{ .line = line, .character = start_char },
         .end = .{ .line = line, .character = end_char },
     });
+}
+
+fn parseTask(text: []const u8) ?struct { status: []const u8, rest: []const u8 } {
+    if (text.len < 3) return null;
+    if (text[0] != '[' or text[2] != ']') return null;
+    if (text[1] != ' ' and text[1] != 'x' and text[1] != 'X') return null;
+    const status = text[0..3];
+    var rest = text[3..];
+    rest = std.mem.trimLeft(u8, rest, " \t");
+    return .{ .status = status, .rest = rest };
 }
 
 fn addTagsFromLine(
@@ -1034,6 +1050,32 @@ test "tags are symbols" {
     }
     try std.testing.expect(tag_one);
     try std.testing.expect(tag_two);
+}
+
+test "tasks are symbols" {
+    const input =
+        \\- [ ] todo
+        \\- [x] done
+        \\
+    ;
+    var parser = Parser{};
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    var todo_found = false;
+    var done_found = false;
+    for (parsed.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "Task: [ ] todo")) todo_found = true;
+        if (std.mem.eql(u8, sym.name, "Task: [x] done")) done_found = true;
+    }
+    try std.testing.expect(todo_found);
+    try std.testing.expect(done_found);
 }
 
 test "inline code spans suppress links" {
