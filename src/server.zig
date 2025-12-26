@@ -421,6 +421,8 @@ fn handleDefinition(server: *Server, writer: anytype, root: std.json.Value) !voi
 
 const CompletionItem = struct {
     label: []const u8,
+    insert_text: ?[]const u8 = null,
+    insert_text_format: ?u8 = null,
 };
 
 const Diagnostic = struct {
@@ -467,7 +469,10 @@ fn handleCompletion(server: *Server, writer: anytype, root: std.json.Value) !voi
 
     var items: std.ArrayList(CompletionItem) = .empty;
     defer {
-        for (items.items) |item| server.allocator.free(item.label);
+        for (items.items) |item| {
+            server.allocator.free(item.label);
+            if (item.insert_text) |text| server.allocator.free(text);
+        }
         items.deinit(server.allocator);
     }
 
@@ -605,6 +610,13 @@ fn sendCompletionResult(
         if (idx > 0) try out.writeByte(',');
         try out.writeAll("{\"label\":");
         try protocol.writeJsonString(out, item.label);
+        if (item.insert_text) |insert_text| {
+            try out.writeAll(",\"insertText\":");
+            try protocol.writeJsonString(out, insert_text);
+            const format = item.insert_text_format orelse 1;
+            try out.writeAll(",\"insertTextFormat\":");
+            try out.print("{d}", .{format});
+        }
         try out.writeAll("}");
     }
     try out.writeAll("]}}");
@@ -971,7 +983,10 @@ fn collectCompletions(
         .wiki => try appendWikiCompletions(server, items, server.allocator, prefix),
         .inline_anchor => try appendHeadingCompletions(doc, items, server.allocator, true, prefix),
         .inline_path => try appendPathCompletions(server, doc, items, server.allocator, prefix),
-        .general => try appendHeadingCompletions(doc, items, server.allocator, false, prefix),
+        .general => {
+            try appendHeadingCompletions(doc, items, server.allocator, false, prefix);
+            try appendSnippetCompletions(items, server.allocator);
+        },
     }
 }
 
@@ -1170,6 +1185,38 @@ fn appendHeadingCompletions(
         if (!startsWithIgnoreCase(heading.text, prefix)) continue;
         const label = try std.fmt.allocPrint(allocator, "{s}", .{heading.text});
         try items.append(allocator, .{ .label = label });
+    }
+}
+
+fn appendSnippetCompletions(
+    items: *std.ArrayList(CompletionItem),
+    allocator: std.mem.Allocator,
+) !void {
+    const Snippet = struct {
+        label: []const u8,
+        text: []const u8,
+    };
+    const snippets = [_]Snippet{
+        .{ .label = "Snippet: Code block", .text = "```$1\n$0\n```" },
+        .{ .label = "Snippet: Frontmatter", .text = "---\ntags: [$1]\n---\n\n$0" },
+        .{ .label = "Snippet: Link", .text = "[$1]($2)" },
+        .{ .label = "Snippet: Image", .text = "![${1:alt}](${2:path})" },
+        .{ .label = "Snippet: Task", .text = "- [ ] $0" },
+        .{ .label = "Snippet: Table", .text = "| ${1:Col1} | ${2:Col2} |\n| --- | --- |\n| ${3:Val1} | ${4:Val2} |\n" },
+        .{ .label = "Snippet: Blockquote", .text = "> $0" },
+        .{ .label = "Snippet: Heading", .text = "# $0" },
+        .{ .label = "Snippet: Numbered list", .text = "1. $0" },
+        .{ .label = "Snippet: Horizontal rule", .text = "---\n" },
+    };
+
+    for (snippets) |snippet| {
+        const label = try allocator.dupe(u8, snippet.label);
+        const text = try allocator.dupe(u8, snippet.text);
+        try items.append(allocator, .{
+            .label = label,
+            .insert_text = text,
+            .insert_text_format = 2,
+        });
     }
 }
 
@@ -3721,7 +3768,10 @@ test "completion suggests wiki, paths, and headings" {
 
     var items: std.ArrayList(CompletionItem) = .empty;
     defer {
-        for (items.items) |item| std.testing.allocator.free(item.label);
+        for (items.items) |item| {
+            std.testing.allocator.free(item.label);
+            if (item.insert_text) |text| std.testing.allocator.free(text);
+        }
         items.deinit(std.testing.allocator);
     }
 
@@ -3752,6 +3802,40 @@ test "completion suggests wiki, paths, and headings" {
     try snap(@src(),
         \\b.md
     ).diff(rendered_path);
+}
+
+test "completion suggests snippets" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "# Heading\n",
+    );
+
+    const doc = server.workspace.getDocument("file:///root/dir/a.md").?;
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| {
+            std.testing.allocator.free(item.label);
+            if (item.insert_text) |text| std.testing.allocator.free(text);
+        }
+        items.deinit(std.testing.allocator);
+    }
+
+    try collectCompletions(&server, doc, .{ .line = 0, .character = 0 }, &items);
+    var snippet_found = false;
+    var code_snippet = false;
+    for (items.items) |item| {
+        if (!std.mem.startsWith(u8, item.label, "Snippet:")) continue;
+        snippet_found = true;
+        if (std.mem.eql(u8, item.label, "Snippet: Code block")) code_snippet = true;
+        try std.testing.expect(item.insert_text != null);
+        try std.testing.expect(item.insert_text_format.? == 2);
+    }
+    try std.testing.expect(snippet_found);
+    try std.testing.expect(code_snippet);
 }
 
 test "diagnostics report link issues" {
