@@ -1207,6 +1207,8 @@ fn appendSnippetCompletions(
         .{ .label = "Snippet: Heading", .text = "# $0" },
         .{ .label = "Snippet: Numbered list", .text = "1. $0" },
         .{ .label = "Snippet: Horizontal rule", .text = "---\n" },
+        .{ .label = "Snippet: Footnote anchor", .text = "[^${1:id}]" },
+        .{ .label = "Snippet: Footnote definition", .text = "\n[^${1:id}]: $0" },
     };
 
     for (snippets) |snippet| {
@@ -3827,15 +3829,21 @@ test "completion suggests snippets" {
     try collectCompletions(&server, doc, .{ .line = 0, .character = 0 }, &items);
     var snippet_found = false;
     var code_snippet = false;
+    var footnote_anchor = false;
+    var footnote_def = false;
     for (items.items) |item| {
         if (!std.mem.startsWith(u8, item.label, "Snippet:")) continue;
         snippet_found = true;
         if (std.mem.eql(u8, item.label, "Snippet: Code block")) code_snippet = true;
+        if (std.mem.eql(u8, item.label, "Snippet: Footnote anchor")) footnote_anchor = true;
+        if (std.mem.eql(u8, item.label, "Snippet: Footnote definition")) footnote_def = true;
         try std.testing.expect(item.insert_text != null);
         try std.testing.expect(item.insert_text_format.? == 2);
     }
     try std.testing.expect(snippet_found);
     try std.testing.expect(code_snippet);
+    try std.testing.expect(footnote_anchor);
+    try std.testing.expect(footnote_def);
 }
 
 test "diagnostics report link issues" {
