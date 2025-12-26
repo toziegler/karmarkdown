@@ -1963,6 +1963,64 @@ test "fuzz: symbol JSON is valid" {
     try std.testing.fuzz(Context{}, Context.testOne, .{});
 }
 
+test "fuzz: document symbols JSON is valid" {
+    const max_len = 2048;
+    const max_items = 8;
+    const root_uri = "file:///tmp/fuzz.md";
+
+    const Context = struct {
+        fn testOne(_: @This(), input: []const u8) anyerror!void {
+            var parser_instance = parser.Parser{};
+            const len = @min(input.len, max_len);
+            const buf = try std.testing.allocator.alloc(u8, len);
+            defer std.testing.allocator.free(buf);
+            std.mem.copyForwards(u8, buf, input[0..len]);
+
+            const parsed_doc = try parser_instance.parse(std.testing.allocator, buf, true);
+            defer {
+                for (parsed_doc.symbols) |sym| std.testing.allocator.free(sym.name);
+                std.testing.allocator.free(parsed_doc.symbols);
+                std.testing.allocator.free(parsed_doc.headings);
+                std.testing.allocator.free(parsed_doc.links);
+                std.testing.allocator.free(parsed_doc.link_defs);
+            }
+
+            const doc = index.Document{
+                .uri = root_uri,
+                .text = buf,
+                .symbols = parsed_doc.symbols,
+                .headings = parsed_doc.headings,
+                .links = parsed_doc.links,
+                .link_defs = parsed_doc.link_defs,
+            };
+
+            const symbols = buildDocumentSymbols(std.testing.allocator, doc);
+            defer freeDocSymbols(std.testing.allocator, symbols);
+
+            const slice_len = @min(symbols.len, max_items);
+            var obj = std.json.ObjectMap.init(std.testing.allocator);
+            defer obj.deinit();
+            try obj.put("id", std.json.Value{ .integer = 3 });
+            const root = std.json.Value{ .object = obj };
+
+            var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer out.deinit();
+            try sendDocumentSymbolResult(&out.writer, root, symbols[0..slice_len]);
+            const msg = try out.toOwnedSlice();
+            defer std.testing.allocator.free(msg);
+
+            const payload = extractPayload(msg) orelse return error.TestExpectedPayload;
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+            defer parsed.deinit();
+            if (parsed.value.object.get("result")) |result_val| {
+                if (result_val != .array) return error.TestExpectedArray;
+            }
+        }
+    };
+
+    try std.testing.fuzz(Context{}, Context.testOne, .{});
+}
+
 test "fuzz: completion and diagnostics JSON are valid" {
     const Context = struct {
         fn testOne(_: @This(), input: []const u8) anyerror!void {
@@ -2009,6 +2067,35 @@ test "fuzz: completion and diagnostics JSON are valid" {
             defer parsed_diag.deinit();
         }
     };
+    try std.testing.fuzz(Context{}, Context.testOne, .{});
+}
+
+test "fuzz: link resolution stays in bounds" {
+    const max_len = 2048;
+    const root_uri = "file:///tmp/fuzz.md";
+
+    const Context = struct {
+        fn testOne(_: @This(), input: []const u8) anyerror!void {
+            var server = Server.init(std.testing.allocator);
+            defer server.deinit();
+
+            const len = @min(input.len, max_len);
+            const buf = try std.testing.allocator.alloc(u8, len);
+            defer std.testing.allocator.free(buf);
+            std.mem.copyForwards(u8, buf, input[0..len]);
+
+            try server.workspace.upsertDocument(root_uri, buf);
+            const doc = server.workspace.getDocument(root_uri).?;
+
+            for (doc.links) |link| {
+                const loc = try resolveLink(&server, doc, link);
+                if (loc) |resolved| {
+                    _ = server.workspace.getDocument(resolved.uri);
+                }
+            }
+        }
+    };
+
     try std.testing.fuzz(Context{}, Context.testOne, .{});
 }
 
