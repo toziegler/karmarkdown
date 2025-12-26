@@ -508,6 +508,10 @@ fn handleCodeAction(server: *Server, writer: anytype, root: std.json.Value) !voi
         }
     }
 
+    if (try buildRenameNoteAction(server, doc_opt)) |action| {
+        try actions.append(server.allocator, action);
+    }
+
     try sendCodeActionResult(writer, root, actions.items);
 }
 
@@ -1052,6 +1056,11 @@ fn parseRange(value: std.json.Value) ?protocol.Range {
 const TextEdit = struct {
     range: protocol.Range,
     new_text: []const u8,
+};
+
+const EditBucket = struct {
+    uri: []const u8,
+    edits: std.ArrayListUnmanaged(TextEdit) = .empty,
 };
 
 fn appendWikiCompletions(
@@ -1862,6 +1871,85 @@ fn buildFixLinkActions(
     return actions.toOwnedSlice(server.allocator);
 }
 
+fn buildRenameNoteAction(server: *Server, doc: index.Document) !?[]const u8 {
+    const heading = firstHeading(doc.headings) orelse return null;
+    var buf: [256]u8 = undefined;
+    const base = slugifyGfmBaseInto(heading.text, &buf);
+    if (base.len == 0) return null;
+
+    const doc_path = uriToPath(server.allocator, doc.uri) orelse return null;
+    defer server.allocator.free(doc_path);
+    const doc_dir = std.fs.path.dirname(doc_path) orelse doc_path;
+
+    const new_path = try std.fs.path.join(server.allocator, &.{ doc_dir, base });
+    defer server.allocator.free(new_path);
+    const new_path_ext = if (!hasMarkdownExtension(new_path))
+        try std.fmt.allocPrint(server.allocator, "{s}.md", .{new_path})
+    else
+        try server.allocator.dupe(u8, new_path);
+    defer server.allocator.free(new_path_ext);
+
+    if (std.mem.eql(u8, new_path_ext, doc_path)) return null;
+    if (pathIsFile(new_path_ext)) return null;
+
+    const new_uri = try pathToUri(server.allocator, new_path_ext);
+    defer server.allocator.free(new_uri);
+
+    var edits_map = std.StringHashMap(EditBucket).init(server.allocator);
+    defer {
+        var it = edits_map.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.edits.items) |edit| server.allocator.free(edit.new_text);
+            entry.value_ptr.edits.deinit(server.allocator);
+        }
+        edits_map.deinit();
+    }
+
+    var it = server.workspace.docs.iterator();
+    while (it.next()) |entry| {
+        const link_doc = entry.value_ptr.*;
+        for (link_doc.links) |link| {
+            const loc = try resolveLink(server, link_doc, link) orelse continue;
+            if (!std.mem.eql(u8, loc.uri, doc.uri)) continue;
+            const replacement = try buildLinkReplacement(server, link_doc, link, new_uri);
+            errdefer server.allocator.free(replacement);
+            try appendEdit(&edits_map, server.allocator, entry.key_ptr.*, .{
+                .range = link.range,
+                .new_text = replacement,
+            });
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(server.allocator);
+    var writer = out.writer(server.allocator);
+    const title = try std.fmt.allocPrint(server.allocator, "Rename note to {s}", .{heading.text});
+    defer server.allocator.free(title);
+    try writer.writeAll("{\"title\":");
+    try protocol.writeJsonString(writer, title);
+    try writer.writeAll(",\"kind\":\"refactor\",\"edit\":{\"documentChanges\":[");
+    try writer.writeAll("{\"kind\":\"rename\",\"oldUri\":");
+    try protocol.writeJsonString(writer, doc.uri);
+    try writer.writeAll(",\"newUri\":");
+    try protocol.writeJsonString(writer, new_uri);
+    try writer.writeAll("}");
+
+    var edit_it = edits_map.iterator();
+    while (edit_it.next()) |entry| {
+        try writer.writeAll(",{\"textDocument\":{\"uri\":");
+        try protocol.writeJsonString(writer, entry.key_ptr.*);
+        try writer.writeAll(",\"version\":null},\"edits\":[");
+        for (entry.value_ptr.edits.items, 0..) |edit, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            try writeTextEdit(writer, edit);
+        }
+        try writer.writeAll("]}");
+    }
+
+    try writer.writeAll("]}}");
+    return out.toOwnedSlice(server.allocator);
+}
+
 fn buildReplaceAction(
     allocator: std.mem.Allocator,
     uri: []const u8,
@@ -1939,6 +2027,29 @@ fn relativePath(allocator: std.mem.Allocator, from_uri: []const u8, to_uri: []co
     defer allocator.free(to_path);
     const from_dir = std.fs.path.dirname(from_path) orelse from_path;
     return std.fs.path.relative(allocator, from_dir, to_path);
+}
+
+fn appendEdit(
+    map: *std.StringHashMap(EditBucket),
+    allocator: std.mem.Allocator,
+    uri: []const u8,
+    edit: TextEdit,
+) !void {
+    if (map.getEntry(uri)) |entry| {
+        try entry.value_ptr.edits.append(allocator, edit);
+        return;
+    }
+    const key = try allocator.dupe(u8, uri);
+    var bucket = EditBucket{ .uri = key };
+    try bucket.edits.append(allocator, edit);
+    try map.put(key, bucket);
+}
+
+fn firstHeading(headings: []const parser.Heading) ?parser.Heading {
+    for (headings) |heading| {
+        if (heading.level == 1) return heading;
+    }
+    return null;
 }
 
 fn pathToUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -2133,6 +2244,42 @@ test "code action fixes broken link" {
 
     var root_obj = std.json.ObjectMap.init(allocator);
     try root_obj.put("id", std.json.Value{ .integer = 11 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    try std.testing.expect(result_val.array.items.len > 0);
+}
+
+test "code action renames note and updates links" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/a.md", "# Alpha\n");
+    try server.workspace.upsertDocument("file:///root/b.md", "[link](a.md)\n");
+    const doc = server.workspace.getDocument("file:///root/a.md").?;
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    const range = try rangeValue(allocator, doc.headings[0].range);
+    try params.put("range", range);
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 12 });
     try root_obj.put("params", std.json.Value{ .object = params });
     const root = std.json.Value{ .object = root_obj };
     defer deinitValue(allocator, root);
