@@ -2833,9 +2833,9 @@ test "code action inserts related section" {
     var server = Server.init(allocator);
     defer server.deinit();
 
-    try server.workspace.upsertDocument("file:///root/a.md", "Tags: #one #two\n");
-    try server.workspace.upsertDocument("file:///root/b.md", "# B\nTag: #two\n");
-    try server.workspace.upsertDocument("file:///root/c.md", "# C\nTag: #three\n");
+    try server.workspace.upsertDocument("file:///root/a.md", "---\ntags: [one, two]\n---\n");
+    try server.workspace.upsertDocument("file:///root/b.md", "---\ntags: [two]\n---\n# B\n");
+    try server.workspace.upsertDocument("file:///root/c.md", "---\ntags: [three]\n---\n# C\n");
 
     const range = protocol.Range{
         .start = .{ .line = 0, .character = 0 },
@@ -2920,9 +2920,9 @@ test "snapshot: code action related section" {
     var server = Server.init(allocator);
     defer server.deinit();
 
-    try server.workspace.upsertDocument("file:///root/a.md", "Tags: #one #two\n");
-    try server.workspace.upsertDocument("file:///root/b.md", "# B\nTag: #two\n");
-    try server.workspace.upsertDocument("file:///root/c.md", "# C\nTag: #three\n");
+    try server.workspace.upsertDocument("file:///root/a.md", "---\ntags: [one, two]\n---\n");
+    try server.workspace.upsertDocument("file:///root/b.md", "---\ntags: [two]\n---\n# B\n");
+    try server.workspace.upsertDocument("file:///root/c.md", "---\ntags: [three]\n---\n# C\n");
 
     const range = protocol.Range{
         .start = .{ .line = 0, .character = 0 },
@@ -3045,7 +3045,7 @@ test "workspace symbols include tags" {
     var server = Server.init(allocator);
     defer server.deinit();
 
-    try server.workspace.upsertDocument("file:///root/a.md", "Tags: #alpha #beta\n");
+    try server.workspace.upsertDocument("file:///root/a.md", "---\ntags: [alpha, beta]\n---\n");
 
     var params = std.json.ObjectMap.init(allocator);
     try params.put("query", std.json.Value{ .string = "#alpha" });

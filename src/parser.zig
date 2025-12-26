@@ -404,11 +404,6 @@ fn parseHeading(state: *ParserState) void {
 
     if (level == 0 or level > 6) return;
 
-    if (last_hash.end_offset < line_end_offset) {
-        const next_ch = state.input[last_hash.end_offset];
-        if (next_ch != ' ' and next_ch != '\t') return;
-    }
-
     const title_slice = state.input[last_hash.end_offset..line_end_offset];
     const title = std.mem.trim(u8, title_slice, " \t");
     if (title.len == 0) return;
@@ -572,6 +567,9 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
     var code_start_offset: usize = 0;
     var code_lang: []const u8 = "";
     var code_start_char: usize = 0;
+    var in_frontmatter = false;
+    var frontmatter_done = false;
+    var collecting_tags = false;
 
     while (line_iter.next()) |line| : (line_index += 1) {
         const line_len = line.len;
@@ -606,14 +604,31 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
             continue;
         }
 
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!frontmatter_done and line_index == 0 and std.mem.eql(u8, trimmed, "---")) {
+            in_frontmatter = true;
+            offset = line_end_offset + 1;
+            continue;
+        }
+
+        if (in_frontmatter) {
+            if (line_index > 0 and (std.mem.eql(u8, trimmed, "---") or std.mem.eql(u8, trimmed, "..."))) {
+                in_frontmatter = false;
+                frontmatter_done = true;
+                offset = line_end_offset + 1;
+                continue;
+            }
+            try parseFrontmatterTagsLine(state, line, line_index, &collecting_tags);
+            offset = line_end_offset + 1;
+            continue;
+        }
+
         if (parseLinkDef(line)) |link_def| {
             state.link_defs.append(state.allocator, link_def) catch {};
             if (findLinkDefStart(line)) |start_col| {
                 try addReferenceDefSymbol(state, link_def.label, line_index, start_col, line_len);
             }
         }
-
-        try addTagsFromLine(state, line, line_index, offset);
 
         if (listItemInfo(line)) |info| {
             const item_text = if (info.text.len == 0) "-" else info.text;
@@ -760,64 +775,85 @@ fn parseTask(text: []const u8) ?struct { status: []const u8, rest: []const u8 } 
     return .{ .status = status, .rest = rest };
 }
 
-fn addTagsFromLine(
+fn parseFrontmatterTagsLine(
     state: *ParserState,
     line: []const u8,
     line_index: usize,
-    line_offset: usize,
+    collecting_tags: *bool,
 ) !void {
     var i: usize = 0;
-    while (i < line.len) {
-        if (line[i] != '#') {
-            i += 1;
-            continue;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    const trimmed = line[i..];
+    if (trimmed.len == 0) return;
+
+    if (collecting_tags.*) {
+        if (trimmed[0] == '-' or trimmed[0] == '*') {
+            var j: usize = 1;
+            while (j < trimmed.len and (trimmed[j] == ' ' or trimmed[j] == '\t')) : (j += 1) {}
+            const tag = std.mem.trim(u8, trimmed[j..], " \t");
+            if (tag.len > 0) {
+                try addFrontmatterTagSymbol(state, tag, line_index, i, line.len);
+            }
+            return;
         }
+        collecting_tags.* = false;
+    }
 
-        if (i + 1 >= line.len or !isTagChar(line[i + 1])) {
-            i += 1;
-            continue;
+    if (trimmed.len >= 5 and std.ascii.eqlIgnoreCase(trimmed[0..4], "tags") and trimmed[4] == ':') {
+        const rest = std.mem.trim(u8, trimmed[5..], " \t");
+        if (rest.len == 0) {
+            collecting_tags.* = true;
+            return;
         }
-
-        if (i > 0 and isTagChar(line[i - 1])) {
-            i += 1;
-            continue;
-        }
-
-        if (line[i + 1] == ' ' or line[i + 1] == '\t') {
-            i += 1;
-            continue;
-        }
-
-        const absolute = line_offset + i;
-        if (offsetInSpans(absolute, state.code_spans) or offsetInSpans(absolute, state.inline_spans)) {
-            i += 1;
-            continue;
-        }
-
-        var j = i + 1;
-        while (j < line.len and isTagChar(line[j])) : (j += 1) {}
-
-        const tag = line[i..j];
-        const name = try std.fmt.allocPrint(state.allocator, "Tag: {s}", .{tag});
-        errdefer state.allocator.free(name);
-        try addSymbol(state, name, protocol.Range{
-            .start = .{ .line = line_index, .character = i },
-            .end = .{ .line = line_index, .character = j },
-        });
-        i = j;
+        try addTagsFromInlineValue(state, rest, line_index, i, line.len);
     }
 }
 
-fn isTagChar(ch: u8) bool {
-    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
-        (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+fn addTagsFromInlineValue(
+    state: *ParserState,
+    value: []const u8,
+    line_index: usize,
+    start_col: usize,
+    end_col: usize,
+) !void {
+    var slice = std.mem.trim(u8, value, " \t");
+    if (slice.len >= 2 and slice[0] == '[' and slice[slice.len - 1] == ']') {
+        slice = std.mem.trim(u8, slice[1 .. slice.len - 1], " \t");
+    }
+
+    if (std.mem.indexOfScalar(u8, slice, ',')) |_| {
+        var it = std.mem.splitScalar(u8, slice, ',');
+        while (it.next()) |part| {
+            const tag = std.mem.trim(u8, part, " \t");
+            if (tag.len == 0) continue;
+            try addFrontmatterTagSymbol(state, tag, line_index, start_col, end_col);
+        }
+        return;
+    }
+
+    var ws = std.mem.splitAny(u8, slice, " \t");
+    while (ws.next()) |part| {
+        const tag = std.mem.trim(u8, part, " \t");
+        if (tag.len == 0) continue;
+        try addFrontmatterTagSymbol(state, tag, line_index, start_col, end_col);
+    }
 }
 
-fn offsetInSpans(offset: usize, spans: []const CodeSpan) bool {
-    for (spans) |span| {
-        if (offset >= span.start and offset < span.end) return true;
-    }
-    return false;
+fn addFrontmatterTagSymbol(
+    state: *ParserState,
+    raw: []const u8,
+    line_index: usize,
+    start_col: usize,
+    end_col: usize,
+) !void {
+    const tag = if (raw.len > 0 and raw[0] == '#') raw[1..] else raw;
+    if (tag.len == 0) return;
+    const name = try std.fmt.allocPrint(state.allocator, "Tag: #{s}", .{tag});
+    errdefer state.allocator.free(name);
+    try addSymbol(state, name, protocol.Range{
+        .start = .{ .line = line_index, .character = start_col },
+        .end = .{ .line = line_index, .character = end_col },
+    });
 }
 
 fn addCodeSymbol(
@@ -1031,9 +1067,13 @@ test "reference link definitions are symbols" {
 
 test "tags are symbols" {
     const input =
-        \\# Heading
-        \\Tag list: #one #two
+        \\---
+        \\tags: [one, two]
+        \\tags:
+        \\  - related
+        \\---
         \\#related
+        \\Tag list: #skip
         \\`#skip`
         \\
     ;
@@ -1050,16 +1090,18 @@ test "tags are symbols" {
     var tag_one = false;
     var tag_two = false;
     var tag_related = false;
+    var heading_related = false;
     for (parsed.symbols) |sym| {
         if (std.mem.eql(u8, sym.name, "Tag: #one")) tag_one = true;
         if (std.mem.eql(u8, sym.name, "Tag: #two")) tag_two = true;
         if (std.mem.eql(u8, sym.name, "Tag: #related")) tag_related = true;
         if (std.mem.eql(u8, sym.name, "Tag: #skip")) return error.TestUnexpectedTag;
-        if (std.mem.startsWith(u8, sym.name, "H1: related")) return error.TestUnexpectedHeading;
+        if (std.mem.startsWith(u8, sym.name, "H1: related")) heading_related = true;
     }
     try std.testing.expect(tag_one);
     try std.testing.expect(tag_two);
     try std.testing.expect(tag_related);
+    try std.testing.expect(heading_related);
 }
 
 test "tasks are symbols" {
