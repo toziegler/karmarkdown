@@ -512,6 +512,10 @@ fn handleCodeAction(server: *Server, writer: anytype, root: std.json.Value) !voi
         try actions.append(server.allocator, action);
     }
 
+    if (try buildExtractSelectionAction(server, doc_opt, range)) |action| {
+        try actions.append(server.allocator, action);
+    }
+
     try sendCodeActionResult(writer, root, actions.items);
 }
 
@@ -1062,6 +1066,33 @@ const EditBucket = struct {
     uri: []const u8,
     edits: std.ArrayListUnmanaged(TextEdit) = .empty,
 };
+
+fn offsetForPosition(text: []const u8, pos: protocol.Position) usize {
+    var line: usize = 0;
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and line < pos.line) : (i += 1) {
+        if (text[i] == '\n') {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    var target = i;
+    while (target < text.len and col < pos.character) : (target += 1) {
+        if (text[target] == '\n') break;
+        col += 1;
+    }
+    return target;
+}
+
+fn sliceForRange(text: []const u8, range: protocol.Range) []const u8 {
+    const start = offsetForPosition(text, range.start);
+    const end = offsetForPosition(text, range.end);
+    if (end <= start or start >= text.len) return "";
+    return text[start..@min(end, text.len)];
+}
 
 fn appendWikiCompletions(
     server: *Server,
@@ -1950,6 +1981,63 @@ fn buildRenameNoteAction(server: *Server, doc: index.Document) !?[]const u8 {
     return out.toOwnedSlice(server.allocator);
 }
 
+fn buildExtractSelectionAction(
+    server: *Server,
+    doc: index.Document,
+    range: protocol.Range,
+) !?[]const u8 {
+    if (range.start.line == range.end.line and range.start.character == range.end.character) return null;
+    const selection = sliceForRange(doc.text, range);
+    if (std.mem.trim(u8, selection, " \t\r\n").len == 0) return null;
+
+    const title = selectionTitle(selection);
+    var buf: [256]u8 = undefined;
+    const base = slugifyGfmBaseInto(title, &buf);
+    const base_name = if (base.len == 0) "note" else base;
+
+    const doc_path = uriToPath(server.allocator, doc.uri) orelse return null;
+    defer server.allocator.free(doc_path);
+    const doc_dir = std.fs.path.dirname(doc_path) orelse doc_path;
+
+    const path = try uniqueNotePath(server.allocator, doc_dir, base_name);
+    defer server.allocator.free(path);
+    const file_uri = try pathToUri(server.allocator, path);
+    defer server.allocator.free(file_uri);
+
+    const content = try std.fmt.allocPrint(server.allocator, "# {s}\n\n{s}\n", .{ title, selection });
+    defer server.allocator.free(content);
+
+    const rel = try relativePath(server.allocator, doc.uri, file_uri);
+    defer server.allocator.free(rel);
+    const link_text = try std.fmt.allocPrint(server.allocator, "[{s}]({s})", .{ title, rel });
+    defer server.allocator.free(link_text);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(server.allocator);
+    var writer = out.writer(server.allocator);
+    try writer.writeAll("{\"title\":\"Extract selection to note\",\"kind\":\"refactor.extract\",\"edit\":{\"documentChanges\":[");
+    try writer.writeAll("{\"kind\":\"create\",\"uri\":");
+    try protocol.writeJsonString(writer, file_uri);
+    try writer.writeAll("},");
+    try writer.writeAll("{\"textDocument\":{\"uri\":");
+    try protocol.writeJsonString(writer, file_uri);
+    try writer.writeAll(",\"version\":null},\"edits\":[");
+    try writeTextEdit(writer, .{
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 0 },
+        },
+        .new_text = content,
+    });
+    try writer.writeAll("]},");
+    try writer.writeAll("{\"textDocument\":{\"uri\":");
+    try protocol.writeJsonString(writer, doc.uri);
+    try writer.writeAll(",\"version\":null},\"edits\":[");
+    try writeTextEdit(writer, .{ .range = range, .new_text = link_text });
+    try writer.writeAll("]}]}}");
+    return out.toOwnedSlice(server.allocator);
+}
+
 fn buildReplaceAction(
     allocator: std.mem.Allocator,
     uri: []const u8,
@@ -2050,6 +2138,29 @@ fn firstHeading(headings: []const parser.Heading) ?parser.Heading {
         if (heading.level == 1) return heading;
     }
     return null;
+}
+
+fn uniqueNotePath(allocator: std.mem.Allocator, base_dir: []const u8, base: []const u8) ![]u8 {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const suffix = if (attempt == 0)
+            try std.fmt.allocPrint(allocator, "{s}.md", .{base})
+        else
+            try std.fmt.allocPrint(allocator, "{s}-{d}.md", .{ base, attempt });
+        defer allocator.free(suffix);
+        const full = try std.fs.path.join(allocator, &.{ base_dir, suffix });
+        if (!pathIsFile(full)) return full;
+        allocator.free(full);
+    }
+}
+
+fn selectionTitle(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return "Note";
 }
 
 fn pathToUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -2280,6 +2391,44 @@ test "code action renames note and updates links" {
 
     var root_obj = std.json.ObjectMap.init(allocator);
     try root_obj.put("id", std.json.Value{ .integer = 12 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    try std.testing.expect(result_val.array.items.len > 0);
+}
+
+test "code action extracts selection" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/a.md", "Line one\nLine two\n");
+
+    const range = protocol.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 8 },
+    };
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    try params.put("range", try rangeValue(allocator, range));
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 13 });
     try root_obj.put("params", std.json.Value{ .object = params });
     const root = std.json.Value{ .object = root_obj };
     defer deinitValue(allocator, root);
