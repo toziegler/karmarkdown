@@ -609,6 +609,9 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
 
         if (parseLinkDef(line)) |link_def| {
             state.link_defs.append(state.allocator, link_def) catch {};
+            if (findLinkDefStart(line)) |start_col| {
+                try addReferenceDefSymbol(state, link_def.label, line_index, start_col, line_len);
+            }
         }
 
         if (isListItem(line)) {
@@ -709,6 +712,21 @@ fn isListItem(line: []const u8) bool {
     return false;
 }
 
+fn addReferenceDefSymbol(
+    state: *ParserState,
+    label: []const u8,
+    line: usize,
+    start_char: usize,
+    end_char: usize,
+) !void {
+    const name = try std.fmt.allocPrint(state.allocator, "Ref: [{s}]", .{label});
+    errdefer state.allocator.free(name);
+    try addSymbol(state, name, protocol.Range{
+        .start = .{ .line = line, .character = start_char },
+        .end = .{ .line = line, .character = end_char },
+    });
+}
+
 fn addListSymbol(
     state: *ParserState,
     start_line: usize,
@@ -721,6 +739,14 @@ fn addListSymbol(
         .start = .{ .line = start_line, .character = 0 },
         .end = .{ .line = end_line, .character = end_char },
     });
+}
+
+fn findLinkDefStart(line: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i >= line.len) return null;
+    if (line[i] != '[') return null;
+    return i;
 }
 
 fn addCodeSymbol(
@@ -908,6 +934,28 @@ test "list blocks and code fences are symbols" {
     try std.testing.expect(list_found);
     try std.testing.expect(code_found);
     try std.testing.expect(heading_found);
+}
+
+test "reference link definitions are symbols" {
+    const input =
+        \\[label]: target.md
+        \\
+    ;
+    var parser = Parser{};
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    var found = false;
+    for (parsed.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "Ref: [label]")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "inline code spans suppress links" {
