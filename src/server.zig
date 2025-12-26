@@ -1269,24 +1269,63 @@ fn findTargetInDoc(
 }
 
 fn resolvePathUri(server: *Server, base_uri: []const u8, path: []const u8) !?[]const u8 {
-    if (std.mem.startsWith(u8, path, "file://")) return path;
+    if (std.mem.startsWith(u8, path, "file://")) {
+        if (server.workspace.getDocument(path) != null) return path;
+        const file_path = uriToPath(server.allocator, path) orelse return null;
+        defer server.allocator.free(file_path);
+        return try ensureDocumentForPath(server, file_path);
+    }
+
     const base_path = uriToPath(server.allocator, base_uri) orelse return null;
     defer server.allocator.free(base_path);
-
     const base_dir = std.fs.path.dirname(base_path) orelse base_path;
-    const joined = if (std.fs.path.isAbsolute(path))
-        try std.fs.path.resolve(server.allocator, &.{ path })
-    else
-        try std.fs.path.resolve(server.allocator, &.{ base_dir, path });
+
+    if (std.fs.path.isAbsolute(path)) {
+        if (try resolveCandidatePath(server, path)) |uri| return uri;
+    } else {
+        if (try resolveFromBase(server, base_dir, path)) |uri| return uri;
+        for (server.workspace.rootsSlice()) |root| {
+            if (try resolveFromBase(server, root, path)) |uri| return uri;
+        }
+    }
+
+    return null;
+}
+
+fn resolveFromBase(server: *Server, base_dir: []const u8, path: []const u8) !?[]const u8 {
+    const joined = try std.fs.path.resolve(server.allocator, &.{ base_dir, path });
     defer server.allocator.free(joined);
+    return try resolveCandidatePath(server, joined);
+}
 
-    const normalized = if (!hasMarkdownExtension(joined) and !std.mem.containsAtLeast(u8, joined, 1, "."))
-        try std.fmt.allocPrint(server.allocator, "{s}.md", .{joined})
-    else
-        try server.allocator.dupe(u8, joined);
-    defer server.allocator.free(normalized);
+fn resolveCandidatePath(server: *Server, path: []const u8) !?[]const u8 {
+    const base = std.fs.path.basename(path);
+    const needs_ext = !hasMarkdownExtension(path) and std.mem.indexOfScalar(u8, base, '.') == null;
 
-    return findDocByPath(server, normalized);
+    if (!needs_ext) {
+        return try ensureDocumentForPath(server, path);
+    }
+
+    const md_path = try std.fmt.allocPrint(server.allocator, "{s}.md", .{path});
+    defer server.allocator.free(md_path);
+    if (try ensureDocumentForPath(server, md_path)) |uri| return uri;
+
+    const markdown_path = try std.fmt.allocPrint(server.allocator, "{s}.markdown", .{path});
+    defer server.allocator.free(markdown_path);
+    return try ensureDocumentForPath(server, markdown_path);
+}
+
+fn ensureDocumentForPath(server: *Server, path: []const u8) !?[]const u8 {
+    if (!server.workspace.shouldIndexPath(path)) return null;
+    if (!pathIsFile(path)) return null;
+    if (findDocByPath(server, path)) |uri| return uri;
+    try server.workspace.upsertDocumentFromPath(path);
+    return findDocByPath(server, path);
+}
+
+fn pathIsFile(path: []const u8) bool {
+    const stat = std.fs.cwd().statFile(path) catch return false;
+    return stat.kind == .file;
 }
 
 fn findDocByTitle(server: *Server, title: []const u8) ?[]const u8 {
@@ -1674,6 +1713,39 @@ test "definition resolves reference links across files" {
     const loc = try resolveLink(&server, doc_a, doc_a.links[0]);
     try std.testing.expect(loc != null);
     try std.testing.expect(std.mem.eql(u8, loc.?.uri, "file:///root/c.md"));
+}
+
+test "definition resolves relative paths with extension fallback" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("notes");
+    try tmp.dir.writeFile(.{ .sub_path = "notes/target.markdown", .data = "# Target\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "[Target](notes/target)\n" });
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    try server.workspace.addRoot(root_path);
+
+    const doc_path = try std.fs.path.join(allocator, &.{ root_path, "doc.md" });
+    defer allocator.free(doc_path);
+    const doc_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{doc_path});
+    defer allocator.free(doc_uri);
+
+    const text = try std.fs.cwd().readFileAlloc(allocator, doc_path, 1024);
+    defer allocator.free(text);
+    try server.workspace.upsertDocument(doc_uri, text);
+
+    const doc = server.workspace.getDocument(doc_uri).?;
+    try std.testing.expect(doc.links.len > 0);
+
+    const loc = try resolveLink(&server, doc, doc.links[0]);
+    try std.testing.expect(loc != null);
+    try std.testing.expect(std.mem.endsWith(u8, loc.?.uri, "notes/target.markdown"));
 }
 
 test "completion suggests wiki, paths, and headings" {
