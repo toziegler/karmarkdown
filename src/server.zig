@@ -687,11 +687,12 @@ fn analyzeInlineTarget(
 fn anchorExists(server: *Server, uri: []const u8, anchor: []const u8) bool {
     const doc_opt = server.workspace.getDocument(uri) orelse return false;
     var target_buf: [256]u8 = undefined;
-    const target = slugifyInto(anchor, &target_buf);
-    for (doc_opt.headings) |heading| {
-        var head_buf: [256]u8 = undefined;
-        const head = slugifyInto(heading.text, &head_buf);
-        if (std.mem.eql(u8, head, target)) return true;
+    const target = slugifyGfmBaseInto(anchor, &target_buf);
+    if (target.len == 0) return false;
+    const ids = buildHeadingIds(server.allocator, doc_opt.headings) catch return false;
+    defer freeHeadingIds(server.allocator, ids);
+    for (ids) |item| {
+        if (std.mem.eql(u8, item.id, target)) return true;
     }
     return false;
 }
@@ -965,18 +966,20 @@ fn appendHeadingCompletions(
     with_hash: bool,
     prefix: []const u8,
 ) !void {
-    for (doc.headings) |heading| {
-        var buf: [256]u8 = undefined;
-        const slug = slugifyInto(heading.text, &buf);
-        if (with_hash) {
-            if (!startsWithIgnoreCase(slug, prefix)) continue;
-        } else {
-            if (!startsWithIgnoreCase(heading.text, prefix)) continue;
+    if (with_hash) {
+        const ids = try buildHeadingIds(allocator, doc.headings);
+        defer freeHeadingIds(allocator, ids);
+        for (ids) |item| {
+            if (!startsWithIgnoreCase(item.id, prefix)) continue;
+            const label = try std.fmt.allocPrint(allocator, "#{s}", .{item.id});
+            try items.append(allocator, .{ .label = label });
         }
-        const label = if (with_hash)
-            try std.fmt.allocPrint(allocator, "#{s}", .{slug})
-        else
-            try std.fmt.allocPrint(allocator, "{s}", .{heading.text});
+        return;
+    }
+
+    for (doc.headings) |heading| {
+        if (!startsWithIgnoreCase(heading.text, prefix)) continue;
+        const label = try std.fmt.allocPrint(allocator, "{s}", .{heading.text});
         try items.append(allocator, .{ .label = label });
     }
 }
@@ -1153,6 +1156,15 @@ fn findLinkAt(links: []const parser.Link, pos: protocol.Position) ?parser.Link {
     return null;
 }
 
+fn findLinkByAnchor(links: []const parser.Link, anchor: []const u8) ?parser.Link {
+    for (links) |link| {
+        if (link.target.anchor) |value| {
+            if (std.mem.eql(u8, value, anchor)) return link;
+        }
+    }
+    return null;
+}
+
 fn posInRange(pos: protocol.Position, range: protocol.Range) bool {
     if (pos.line < range.start.line or pos.line > range.end.line) return false;
     if (pos.line == range.start.line and pos.character < range.start.character) return false;
@@ -1255,14 +1267,15 @@ fn findTargetInDoc(
         };
     }
     var target_buf: [256]u8 = undefined;
-    const target = slugifyInto(anchor.?, &target_buf);
-    for (doc_opt.headings) |heading| {
-        var head_buf: [256]u8 = undefined;
-        const head = slugifyInto(heading.text, &head_buf);
-        if (std.mem.eql(u8, head, target)) {
+    const target = slugifyGfmBaseInto(anchor.?, &target_buf);
+    if (target.len == 0) return null;
+    const ids = try buildHeadingIds(server.allocator, doc_opt.headings);
+    defer freeHeadingIds(server.allocator, ids);
+    for (ids) |item| {
+        if (std.mem.eql(u8, item.id, target)) {
             return .{
                 .uri = uri,
-                .range = heading.range,
+                .range = item.heading.range,
             };
         }
     }
@@ -1382,6 +1395,98 @@ fn slugifyInto(text: []const u8, buf: []u8) []const u8 {
         }
     }
     if (len == 0) return buf[0..0];
+    var capped = @min(len, buf.len);
+    while (capped > 0 and buf[capped - 1] == '-') capped -= 1;
+    return buf[0..capped];
+}
+
+const HeadingId = struct {
+    heading: parser.Heading,
+    id: []const u8,
+};
+
+fn buildHeadingIds(
+    allocator: std.mem.Allocator,
+    headings: []const parser.Heading,
+) ![]HeadingId {
+    var ids: std.ArrayListUnmanaged(HeadingId) = .empty;
+    errdefer {
+        for (ids.items) |item| allocator.free(item.id);
+        ids.deinit(allocator);
+    }
+
+    var base_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (base_keys.items) |key| allocator.free(key);
+        base_keys.deinit(allocator);
+    }
+
+    var counts = std.StringHashMap(usize).init(allocator);
+    defer counts.deinit();
+
+    for (headings) |heading| {
+        var buf: [256]u8 = undefined;
+        const base = slugifyGfmBaseInto(heading.text, &buf);
+        if (base.len == 0) continue;
+
+        var suffix: usize = 0;
+        if (counts.getEntry(base)) |entry| {
+            suffix = entry.value_ptr.*;
+            entry.value_ptr.* = suffix + 1;
+        } else {
+            const key = try allocator.dupe(u8, base);
+            try base_keys.append(allocator, key);
+            try counts.put(key, 1);
+            suffix = 0;
+        }
+
+        const id = if (suffix == 0)
+            try allocator.dupe(u8, base)
+        else
+            try std.fmt.allocPrint(allocator, "{s}-{d}", .{ base, suffix });
+
+        try ids.append(allocator, .{ .heading = heading, .id = id });
+    }
+
+    return ids.toOwnedSlice(allocator);
+}
+
+fn freeHeadingIds(allocator: std.mem.Allocator, ids: []HeadingId) void {
+    for (ids) |item| allocator.free(item.id);
+    allocator.free(ids);
+}
+
+fn slugifyGfmBaseInto(text: []const u8, buf: []u8) []const u8 {
+    var len: usize = 0;
+    var last_dash = false;
+    for (text) |ch| {
+        var lower = ch;
+        if (ch >= 'A' and ch <= 'Z') lower = ch + 32;
+
+        if ((lower >= 'a' and lower <= 'z') or (lower >= '0' and lower <= '9')) {
+            if (len < buf.len) buf[len] = lower;
+            len += 1;
+            last_dash = false;
+            continue;
+        }
+
+        if (lower == '_') {
+            if (len < buf.len) buf[len] = lower;
+            len += 1;
+            last_dash = false;
+            continue;
+        }
+
+        if (lower == ' ' or lower == '-') {
+            if (!last_dash) {
+                if (len < buf.len) buf[len] = '-';
+                len += 1;
+                last_dash = true;
+            }
+            continue;
+        }
+    }
+
     var capped = @min(len, buf.len);
     while (capped > 0 and buf[capped - 1] == '-') capped -= 1;
     return buf[0..capped];
@@ -1715,6 +1820,35 @@ test "definition resolves reference links across files" {
     const loc = try resolveLink(&server, doc_a, doc_a.links[0]);
     try std.testing.expect(loc != null);
     try std.testing.expect(std.mem.eql(u8, loc.?.uri, "file:///root/c.md"));
+}
+
+test "definition resolves gfm-style heading ids" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    const text =
+        \\# Hello, World!
+        \\## Hello World
+        \\## Hello World
+        \\
+        \\[one](#Hello, World!)
+        \\[two](#hello-world-1)
+        \\
+    ;
+    try server.workspace.upsertDocument("file:///doc.md", text);
+    const doc = server.workspace.getDocument("file:///doc.md").?;
+
+    const first = findLinkByAnchor(doc.links, "Hello, World!") orelse return error.TestExpectedLink;
+    const second = findLinkByAnchor(doc.links, "hello-world-1") orelse return error.TestExpectedLink;
+
+    const first_loc = try resolveLink(&server, doc, first);
+    try std.testing.expect(first_loc != null);
+    try std.testing.expectEqual(@as(usize, 0), first_loc.?.range.start.line);
+
+    const second_loc = try resolveLink(&server, doc, second);
+    try std.testing.expect(second_loc != null);
+    try std.testing.expectEqual(@as(usize, 1), second_loc.?.range.start.line);
 }
 
 test "definition resolves relative paths with extension fallback" {
