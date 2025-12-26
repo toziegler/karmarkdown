@@ -1014,7 +1014,7 @@ fn buildDocumentSymbols(
     }
 
     for (doc.symbols, 0..) |sym, idx| {
-        if (!isBlockSymbol(sym, doc.headings)) continue;
+        if (!isDocSymbolEntry(sym, doc.headings)) continue;
         entries.append(allocator, .{
             .kind = .block,
             .line = sym.range.start.line,
@@ -1108,10 +1108,11 @@ fn rangeEqual(a: protocol.Range, b: protocol.Range) bool {
         a.end.line == b.end.line and a.end.character == b.end.character;
 }
 
-fn isBlockSymbol(sym: index.Symbol, headings: []parser.Heading) bool {
-    if (!std.mem.startsWith(u8, sym.name, "List:") and !std.mem.startsWith(u8, sym.name, "Code:")) {
-        return false;
-    }
+fn isDocSymbolEntry(sym: index.Symbol, headings: []parser.Heading) bool {
+    const is_list = std.mem.startsWith(u8, sym.name, "List:");
+    const is_code = std.mem.startsWith(u8, sym.name, "Code:");
+    const is_link = std.mem.startsWith(u8, sym.name, "Link:");
+    if (!is_list and !is_code and !is_link) return false;
     for (headings) |heading| {
         if (rangeEqual(sym.range, heading.range)) return false;
     }
@@ -1532,7 +1533,7 @@ test "snapshot: document symbol hierarchy" {
     const text =
         \\# Title
         \\
-        \\- item
+        \\- [item](doc.md)
         \\- item2
         \\
         \\```zig
@@ -1554,6 +1555,7 @@ test "snapshot: document symbol hierarchy" {
     try snap(@src(),
         \\H1: Title
         \\  List: -
+        \\  Link: [item](doc.md)
         \\  Code: zig
         \\  H2: Sub
     ).diff(rendered);
