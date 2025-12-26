@@ -614,6 +614,8 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
             }
         }
 
+        try addTagsFromLine(state, line, line_index, offset);
+
         if (isListItem(line)) {
             if (!list_active) {
                 list_active = true;
@@ -747,6 +749,66 @@ fn findLinkDefStart(line: []const u8) ?usize {
     if (i >= line.len) return null;
     if (line[i] != '[') return null;
     return i;
+}
+
+fn addTagsFromLine(
+    state: *ParserState,
+    line: []const u8,
+    line_index: usize,
+    line_offset: usize,
+) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] != '#') {
+            i += 1;
+            continue;
+        }
+
+        if (i + 1 >= line.len or !isTagChar(line[i + 1])) {
+            i += 1;
+            continue;
+        }
+
+        if (i > 0 and isTagChar(line[i - 1])) {
+            i += 1;
+            continue;
+        }
+
+        if (line[i + 1] == ' ' or line[i + 1] == '\t') {
+            i += 1;
+            continue;
+        }
+
+        const absolute = line_offset + i;
+        if (offsetInSpans(absolute, state.code_spans) or offsetInSpans(absolute, state.inline_spans)) {
+            i += 1;
+            continue;
+        }
+
+        var j = i + 1;
+        while (j < line.len and isTagChar(line[j])) : (j += 1) {}
+
+        const tag = line[i..j];
+        const name = try std.fmt.allocPrint(state.allocator, "Tag: {s}", .{tag});
+        errdefer state.allocator.free(name);
+        try addSymbol(state, name, protocol.Range{
+            .start = .{ .line = line_index, .character = i },
+            .end = .{ .line = line_index, .character = j },
+        });
+        i = j;
+    }
+}
+
+fn isTagChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+        (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+}
+
+fn offsetInSpans(offset: usize, spans: []const CodeSpan) bool {
+    for (spans) |span| {
+        if (offset >= span.start and offset < span.end) return true;
+    }
+    return false;
 }
 
 fn addCodeSymbol(
@@ -956,6 +1018,34 @@ test "reference link definitions are symbols" {
         if (std.mem.eql(u8, sym.name, "Ref: [label]")) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "tags are symbols" {
+    const input =
+        \\# Heading
+        \\Tag list: #one #two
+        \\`#skip`
+        \\
+    ;
+    var parser = Parser{};
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    var tag_one = false;
+    var tag_two = false;
+    for (parsed.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "Tag: #one")) tag_one = true;
+        if (std.mem.eql(u8, sym.name, "Tag: #two")) tag_two = true;
+        if (std.mem.eql(u8, sym.name, "Tag: #skip")) return error.TestUnexpectedTag;
+    }
+    try std.testing.expect(tag_one);
+    try std.testing.expect(tag_two);
 }
 
 test "inline code spans suppress links" {
