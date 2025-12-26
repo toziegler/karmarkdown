@@ -1777,6 +1777,46 @@ test "workspace symbol indexes new files on demand" {
     try std.testing.expect(found);
 }
 
+test "workspace symbols include tags" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/a.md", "Tags: #alpha #beta\n");
+
+    var params = std.json.ObjectMap.init(allocator);
+    try params.put("query", std.json.Value{ .string = "#alpha" });
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 4 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleWorkspaceSymbol(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    var found = false;
+    for (result_val.array.items) |item| {
+        if (item != .object) continue;
+        const name_val = item.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (std.mem.eql(u8, name_val.string, "Tag: #alpha")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "snapshot: document symbol response" {
     const allocator = std.testing.allocator;
     var obj = std.json.ObjectMap.init(allocator);
