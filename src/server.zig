@@ -359,6 +359,8 @@ fn handleWorkspaceSymbol(server: *Server, writer: anytype, root: std.json.Value)
     const query_val = params.object.get("query") orelse return;
     if (query_val != .string) return;
 
+    try server.workspace.indexRootsIncremental();
+
     var collected: std.ArrayList(WorkspaceSymbolEntry) = .empty;
     defer collected.deinit(server.allocator);
 
@@ -1724,6 +1726,55 @@ test "workspace symbol response is valid JSON" {
     const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
     if (result_val != .array) return error.TestExpectedArray;
     try std.testing.expectEqual(@as(usize, 1), result_val.array.items.len);
+}
+
+test "workspace symbol indexes new files on demand" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "old.md", .data = "# Old\n" });
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    try server.workspace.addRoot(root_path);
+    try server.workspace.indexRoots();
+
+    try tmp.dir.writeFile(.{ .sub_path = "new.md", .data = "# New\n" });
+
+    var params = std.json.ObjectMap.init(allocator);
+    try params.put("query", std.json.Value{ .string = "New" });
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 3 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleWorkspaceSymbol(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    var found = false;
+    for (result_val.array.items) |item| {
+        if (item != .object) continue;
+        const name_val = item.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (std.mem.containsAtLeast(u8, name_val.string, 1, "H1: New")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "snapshot: document symbol response" {

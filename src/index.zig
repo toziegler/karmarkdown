@@ -147,6 +147,12 @@ pub const Workspace = struct {
         }
     }
 
+    pub fn indexRootsIncremental(self: *Workspace) !void {
+        for (self.roots.items) |root| {
+            try self.indexFolderIncremental(root);
+        }
+    }
+
     pub fn setExtensions(self: *Workspace, extensions: []const []const u8) !void {
         self.clearExtensions();
         for (extensions) |ext| {
@@ -220,6 +226,25 @@ pub const Workspace = struct {
             if (isExcluded(full_path, self.config.excludes.items)) continue;
             if (!hasExtension(full_path, self.config.extensions.items)) continue;
             if (!fileWithinSize(full_path, self.config.max_file_size_bytes)) continue;
+            try self.upsertDocumentFromPath(full_path);
+        }
+    }
+
+    fn indexFolderIncremental(self: *Workspace, root: []const u8) !void {
+        var dir = try std.fs.openDirAbsolute(root, .{ .iterate = true });
+        defer dir.close();
+
+        var walker = try dir.walk(self.allocator);
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+            if (entry.kind != .file) continue;
+            const full_path = try std.fs.path.join(self.allocator, &.{ root, entry.path });
+            defer self.allocator.free(full_path);
+            if (isExcluded(full_path, self.config.excludes.items)) continue;
+            if (!hasExtension(full_path, self.config.extensions.items)) continue;
+            if (!fileWithinSize(full_path, self.config.max_file_size_bytes)) continue;
+            if (self.getDocumentPath(full_path) != null) continue;
             try self.upsertDocumentFromPath(full_path);
         }
     }
