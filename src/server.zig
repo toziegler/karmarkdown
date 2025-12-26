@@ -96,6 +96,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 try handleCompletion(&server, stdout, root);
                 continue;
             }
+            if (std.mem.eql(u8, m, "textDocument/codeAction")) {
+                try handleCodeAction(&server, stdout, root);
+                continue;
+            }
         }
     }
 }
@@ -178,6 +182,7 @@ fn sendInitializeResponse(writer: anytype, root: std.json.Value) !void {
     try out.writeAll("\"textDocumentSync\":1,");
     try out.writeAll("\"documentSymbolProvider\":true,");
     try out.writeAll("\"workspaceSymbolProvider\":true,");
+    try out.writeAll("\"codeActionProvider\":true,");
     try out.writeAll("\"completionProvider\":{\"triggerCharacters\":[\"[\",\"#\"]}");
     try out.writeAll("}}}");
 
@@ -470,6 +475,34 @@ fn handleCompletion(server: *Server, writer: anytype, root: std.json.Value) !voi
     try sendCompletionResult(writer, root, items.items);
 }
 
+fn handleCodeAction(server: *Server, writer: anytype, root: std.json.Value) !void {
+    const params = root.object.get("params") orelse return;
+    const doc = params.object.get("textDocument") orelse return;
+    const uri_val = doc.object.get("uri") orelse return;
+    const range_val = params.object.get("range") orelse return;
+    if (uri_val != .string) return;
+    const range = parseRange(range_val) orelse return;
+
+    const doc_opt = server.workspace.getDocument(uri_val.string) orelse {
+        try sendCodeActionResult(writer, root, &.{});
+        return;
+    };
+
+    var actions: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (actions.items) |item| server.allocator.free(item);
+        actions.deinit(server.allocator);
+    }
+
+    if (findLinkAt(doc_opt.links, range.start)) |link| {
+        if (try buildCreateNoteAction(server, doc_opt, link)) |action| {
+            try actions.append(server.allocator, action);
+        }
+    }
+
+    try sendCodeActionResult(writer, root, actions.items);
+}
+
 fn sendSymbolResult(
     writer: anytype,
     root: std.json.Value,
@@ -545,6 +578,31 @@ fn sendCompletionResult(
         try out.writeAll("}");
     }
     try out.writeAll("]}}");
+
+    try lsp.writeMessage(writer, payload.items);
+}
+
+fn sendCodeActionResult(
+    writer: anytype,
+    root: std.json.Value,
+    actions: []const []const u8,
+) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.heap.page_allocator);
+
+    var out = payload.writer(std.heap.page_allocator);
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    if (getId(root)) |id_val| {
+        try writeJsonValue(out, id_val);
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"result\":[");
+    for (actions, 0..) |action, idx| {
+        if (idx > 0) try out.writeByte(',');
+        try out.writeAll(action);
+    }
+    try out.writeAll("]}");
 
     try lsp.writeMessage(writer, payload.items);
 }
@@ -964,6 +1022,29 @@ fn getLineSlice(text: []const u8, pos: protocol.Position) []const u8 {
     while (line_end < text.len and text[line_end] != '\n') : (line_end += 1) {}
     return text[line_start..line_end];
 }
+
+fn parseRange(value: std.json.Value) ?protocol.Range {
+    if (value != .object) return null;
+    const start_val = value.object.get("start") orelse return null;
+    const end_val = value.object.get("end") orelse return null;
+    if (start_val != .object or end_val != .object) return null;
+
+    const start_line = start_val.object.get("line") orelse return null;
+    const start_char = start_val.object.get("character") orelse return null;
+    const end_line = end_val.object.get("line") orelse return null;
+    const end_char = end_val.object.get("character") orelse return null;
+    if (start_line != .integer or start_char != .integer or end_line != .integer or end_char != .integer) return null;
+
+    return .{
+        .start = .{ .line = @intCast(start_line.integer), .character = @intCast(start_char.integer) },
+        .end = .{ .line = @intCast(end_line.integer), .character = @intCast(end_char.integer) },
+    };
+}
+
+const TextEdit = struct {
+    range: protocol.Range,
+    new_text: []const u8,
+};
 
 fn appendWikiCompletions(
     server: *Server,
@@ -1594,6 +1675,122 @@ fn slugifyGfmBaseInto(text: []const u8, buf: []u8) []const u8 {
     return buf[0..capped];
 }
 
+fn resolveLinkTarget(server: *Server, doc: index.Document, link: parser.Link) ?parser.LinkTarget {
+    switch (link.kind) {
+        .wiki, .inline_link => return link.target,
+        .reference => {
+            const label = link.target.label orelse return null;
+            const norm = normalizeLabel(label);
+            for (doc.link_defs) |def| {
+                if (std.mem.eql(u8, normalizeLabel(def.label), norm)) return def.target;
+            }
+            var it = server.workspace.docs.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.link_defs) |def| {
+                    if (std.mem.eql(u8, normalizeLabel(def.label), norm)) return def.target;
+                }
+            }
+        },
+    }
+    return null;
+}
+
+fn isWebLink(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://");
+}
+
+fn buildNotePath(allocator: std.mem.Allocator, base_dir: []const u8, raw_path: []const u8) ![]u8 {
+    const joined = if (std.fs.path.isAbsolute(raw_path))
+        try std.fs.path.resolve(allocator, &.{ raw_path })
+    else
+        try std.fs.path.resolve(allocator, &.{ base_dir, raw_path });
+    defer allocator.free(joined);
+
+    const base = std.fs.path.basename(joined);
+    const needs_ext = !hasMarkdownExtension(joined) and std.mem.indexOfScalar(u8, base, '.') == null;
+    if (!needs_ext) return try allocator.dupe(u8, joined);
+    return try std.fmt.allocPrint(allocator, "{s}.md", .{joined});
+}
+
+fn noteTitleFromTarget(target: parser.LinkTarget, path: []const u8) []const u8 {
+    if (target.label) |label| return label;
+    if (target.path) |raw| {
+        const base = std.fs.path.basename(raw);
+        const title = stripExtension(base);
+        if (title.len > 0) return title;
+    }
+    const base = std.fs.path.basename(path);
+    const title = stripExtension(base);
+    return if (title.len == 0) "Note" else title;
+}
+
+fn writeTextEdit(writer: anytype, edit: TextEdit) !void {
+    try writer.writeAll("{\"range\":{\"start\":{\"line\":");
+    try writer.print("{d}", .{edit.range.start.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{edit.range.start.character});
+    try writer.writeAll("},\"end\":{\"line\":");
+    try writer.print("{d}", .{edit.range.end.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{edit.range.end.character});
+    try writer.writeAll("}},\"newText\":");
+    try protocol.writeJsonString(writer, edit.new_text);
+    try writer.writeAll("}");
+}
+
+fn buildCreateNoteAction(
+    server: *Server,
+    doc: index.Document,
+    link: parser.Link,
+) !?[]const u8 {
+    const target = resolveLinkTarget(server, doc, link) orelse return null;
+    if (target.path == null) return null;
+    if (isWebLink(target.path.?)) return null;
+
+    const base_path = uriToPath(server.allocator, doc.uri) orelse return null;
+    defer server.allocator.free(base_path);
+    const base_dir = std.fs.path.dirname(base_path) orelse base_path;
+
+    const path = try buildNotePath(server.allocator, base_dir, target.path.?);
+    defer server.allocator.free(path);
+    if (pathIsFile(path)) return null;
+
+    const file_uri = try pathToUri(server.allocator, path);
+    defer server.allocator.free(file_uri);
+
+    const title = noteTitleFromTarget(target, path);
+    const action_title = try std.fmt.allocPrint(server.allocator, "Create note: {s}", .{title});
+    defer server.allocator.free(action_title);
+    const content = try std.fmt.allocPrint(server.allocator, "# {s}\n", .{title});
+    defer server.allocator.free(content);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(server.allocator);
+    var writer = out.writer(server.allocator);
+    try writer.writeAll("{\"title\":");
+    try protocol.writeJsonString(writer, action_title);
+    try writer.writeAll(",\"kind\":\"quickfix\",\"edit\":{\"documentChanges\":[");
+    try writer.writeAll("{\"kind\":\"create\",\"uri\":");
+    try protocol.writeJsonString(writer, file_uri);
+    try writer.writeAll("},");
+    try writer.writeAll("{\"textDocument\":{\"uri\":");
+    try protocol.writeJsonString(writer, file_uri);
+    try writer.writeAll(",\"version\":null},\"edits\":[");
+    try writeTextEdit(writer, .{
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 0 },
+        },
+        .new_text = content,
+    });
+    try writer.writeAll("]}]}}");
+    return out.toOwnedSlice(server.allocator);
+}
+
+fn pathToUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "file://{s}", .{path});
+}
+
 const DecodedText = struct {
     text: []const u8,
     owned: bool,
@@ -1727,6 +1924,41 @@ test "workspace symbol response is valid JSON" {
     const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
     if (result_val != .array) return error.TestExpectedArray;
     try std.testing.expectEqual(@as(usize, 1), result_val.array.items.len);
+}
+
+test "code action creates missing note" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument("file:///root/doc.md", "[Missing](missing.md)\n");
+    const doc = server.workspace.getDocument("file:///root/doc.md").?;
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/doc.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    const range = try rangeValue(allocator, doc.links[0].range);
+    try params.put("range", range);
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 10 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+    try std.testing.expect(result_val.array.items.len > 0);
 }
 
 test "workspace symbol indexes new files on demand" {
@@ -1940,6 +2172,21 @@ fn extractPayload(message: []const u8) ?[]const u8 {
     const marker = "\r\n\r\n";
     const idx = std.mem.indexOf(u8, message, marker) orelse return null;
     return message[idx + marker.len ..];
+}
+
+fn rangeValue(allocator: std.mem.Allocator, range: protocol.Range) !std.json.Value {
+    var start = std.json.ObjectMap.init(allocator);
+    try start.put("line", std.json.Value{ .integer = range.start.line });
+    try start.put("character", std.json.Value{ .integer = range.start.character });
+
+    var end = std.json.ObjectMap.init(allocator);
+    try end.put("line", std.json.Value{ .integer = range.end.line });
+    try end.put("character", std.json.Value{ .integer = range.end.character });
+
+    var obj = std.json.ObjectMap.init(allocator);
+    try obj.put("start", std.json.Value{ .object = start });
+    try obj.put("end", std.json.Value{ .object = end });
+    return std.json.Value{ .object = obj };
 }
 
 fn renderDocSymbols(allocator: std.mem.Allocator, symbols: []DocSymbol) ![]u8 {
