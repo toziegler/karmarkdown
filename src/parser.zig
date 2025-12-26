@@ -337,6 +337,10 @@ fn parseFile(state: *ParserState) void {
             parseHeading(state);
             continue;
         }
+        if (atMarkerStart(state)) {
+            parseMarker(state);
+            continue;
+        }
         if (atLinkStart(state)) {
             parseLink(state);
             continue;
@@ -353,6 +357,32 @@ fn atHeadingStart(state: *ParserState) bool {
 fn atLinkStart(state: *ParserState) bool {
     if (at(state, .DoubleLBracket)) return state.enable_wiki;
     return at(state, .LBracket);
+}
+
+fn atMarkerStart(state: *ParserState) bool {
+    if (!at(state, .LBracket)) return false;
+    if (state.index + 2 >= state.tokens.len) return false;
+    const text_tok = state.tokens[state.index + 1];
+    if (text_tok.kind != .Text) return false;
+    const close_tok = state.tokens[state.index + 2];
+    if (close_tok.kind != .RBracket) return false;
+    if (state.index + 3 < state.tokens.len and state.tokens[state.index + 3].kind == .LParen) return false;
+    const raw = state.input[text_tok.start_offset..text_tok.end_offset];
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    return trimmed.len > 1 and trimmed[0] == '@';
+}
+
+fn parseMarker(state: *ParserState) void {
+    const start_tok = bump(state);
+    const text_tok = current(state);
+    const raw = state.input[text_tok.start_offset..text_tok.end_offset];
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    _ = bump(state);
+    const close_tok = if (at(state, .RBracket)) bump(state) else start_tok;
+    if (trimmed.len <= 1) return;
+    const name = std.fmt.allocPrint(state.allocator, "Tag: {s}", .{trimmed}) catch return;
+    errdefer state.allocator.free(name);
+    addSymbol(state, name, protocol.Range{ .start = start_tok.start, .end = close_tok.end }) catch return;
 }
 
 fn skipCodeSpan(state: *ParserState) bool {
@@ -1102,6 +1132,36 @@ test "tags are symbols" {
     try std.testing.expect(tag_two);
     try std.testing.expect(tag_related);
     try std.testing.expect(heading_related);
+}
+
+test "custom markers are symbols" {
+    const input =
+        \\Idea [@blog] and [@Dev].
+        \\`[@skip]`
+        \\[@link](doc.md)
+    ;
+    var parser = Parser{};
+    const parsed = try parser.parse(std.testing.allocator, input, true);
+    defer {
+        for (parsed.symbols) |sym| std.testing.allocator.free(sym.name);
+        std.testing.allocator.free(parsed.symbols);
+        std.testing.allocator.free(parsed.headings);
+        std.testing.allocator.free(parsed.links);
+        std.testing.allocator.free(parsed.link_defs);
+    }
+
+    var blog_found = false;
+    var dev_found = false;
+    var link_found = false;
+    for (parsed.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "Tag: @blog")) blog_found = true;
+        if (std.mem.eql(u8, sym.name, "Tag: @Dev")) dev_found = true;
+        if (std.mem.startsWith(u8, sym.name, "Link: [@link]")) link_found = true;
+        if (std.mem.eql(u8, sym.name, "Tag: @skip")) return error.TestUnexpectedTag;
+    }
+    try std.testing.expect(blog_found);
+    try std.testing.expect(dev_found);
+    try std.testing.expect(link_found);
 }
 
 test "tasks are symbols" {
