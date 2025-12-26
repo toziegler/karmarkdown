@@ -686,8 +686,10 @@ fn analyzeInlineTarget(
 
 fn anchorExists(server: *Server, uri: []const u8, anchor: []const u8) bool {
     const doc_opt = server.workspace.getDocument(uri) orelse return false;
+    const decoded = decodePercentOrCopy(server.allocator, anchor);
+    defer if (decoded.owned) server.allocator.free(decoded.text);
     var target_buf: [256]u8 = undefined;
-    const target = slugifyGfmBaseInto(anchor, &target_buf);
+    const target = slugifyGfmBaseInto(decoded.text, &target_buf);
     if (target.len == 0) return false;
     const ids = buildHeadingIds(server.allocator, doc_opt.headings) catch return false;
     defer freeHeadingIds(server.allocator, ids);
@@ -1266,8 +1268,10 @@ fn findTargetInDoc(
             },
         };
     }
+    const decoded = decodePercentOrCopy(server.allocator, anchor.?);
+    defer if (decoded.owned) server.allocator.free(decoded.text);
     var target_buf: [256]u8 = undefined;
-    const target = slugifyGfmBaseInto(anchor.?, &target_buf);
+    const target = slugifyGfmBaseInto(decoded.text, &target_buf);
     if (target.len == 0) return null;
     const ids = try buildHeadingIds(server.allocator, doc_opt.headings);
     defer freeHeadingIds(server.allocator, ids);
@@ -1283,10 +1287,14 @@ fn findTargetInDoc(
 }
 
 fn resolvePathUri(server: *Server, base_uri: []const u8, path: []const u8) !?[]const u8 {
-    if (std.mem.startsWith(u8, path, "file://")) {
-        if (server.workspace.getDocument(path) != null) return path;
-        const file_path = uriToPath(server.allocator, path) orelse return null;
+    const decoded = try decodePercent(server.allocator, path);
+    defer if (decoded.owned) server.allocator.free(decoded.text);
+    const normalized_path = decoded.text;
+
+    if (std.mem.startsWith(u8, normalized_path, "file://")) {
+        const file_path = uriToPath(server.allocator, normalized_path) orelse return null;
         defer server.allocator.free(file_path);
+        if (findDocByPath(server, file_path)) |uri| return uri;
         return try ensureDocumentForPath(server, file_path);
     }
 
@@ -1294,12 +1302,12 @@ fn resolvePathUri(server: *Server, base_uri: []const u8, path: []const u8) !?[]c
     defer server.allocator.free(base_path);
     const base_dir = std.fs.path.dirname(base_path) orelse base_path;
 
-    if (std.fs.path.isAbsolute(path)) {
-        if (try resolveCandidatePath(server, path)) |uri| return uri;
+    if (std.fs.path.isAbsolute(normalized_path)) {
+        if (try resolveCandidatePath(server, normalized_path)) |uri| return uri;
     } else {
-        if (try resolveFromBase(server, base_dir, path)) |uri| return uri;
+        if (try resolveFromBase(server, base_dir, normalized_path)) |uri| return uri;
         for (server.workspace.rootsSlice()) |root| {
-            if (try resolveFromBase(server, root, path)) |uri| return uri;
+            if (try resolveFromBase(server, root, normalized_path)) |uri| return uri;
         }
     }
 
@@ -1490,6 +1498,48 @@ fn slugifyGfmBaseInto(text: []const u8, buf: []u8) []const u8 {
     var capped = @min(len, buf.len);
     while (capped > 0 and buf[capped - 1] == '-') capped -= 1;
     return buf[0..capped];
+}
+
+const DecodedText = struct {
+    text: []const u8,
+    owned: bool,
+};
+
+fn decodePercentOrCopy(allocator: std.mem.Allocator, text: []const u8) DecodedText {
+    return decodePercent(allocator, text) catch .{ .text = text, .owned = false };
+}
+
+fn decodePercent(allocator: std.mem.Allocator, text: []const u8) !DecodedText {
+    if (std.mem.indexOfScalar(u8, text, '%') == null) {
+        return .{ .text = text, .owned = false };
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '%' and i + 2 < text.len) {
+            if (hexValue(text[i + 1])) |hi| {
+                if (hexValue(text[i + 2])) |lo| {
+                    try out.append(allocator, (hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+
+    return .{ .text = try out.toOwnedSlice(allocator), .owned = true };
+}
+
+fn hexValue(ch: u8) ?u8 {
+    if (ch >= '0' and ch <= '9') return ch - '0';
+    if (ch >= 'a' and ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' and ch <= 'F') return ch - 'A' + 10;
+    return null;
 }
 
 fn findDocByPath(server: *Server, path: []const u8) ?[]const u8 {
@@ -1849,6 +1899,38 @@ test "definition resolves gfm-style heading ids" {
     const second_loc = try resolveLink(&server, doc, second);
     try std.testing.expect(second_loc != null);
     try std.testing.expectEqual(@as(usize, 1), second_loc.?.range.start.line);
+}
+
+test "definition resolves percent-encoded paths" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "My File.md", .data = "# Target\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "[Target](My%20File)\n" });
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    try server.workspace.addRoot(root_path);
+
+    const doc_path = try std.fs.path.join(allocator, &.{ root_path, "doc.md" });
+    defer allocator.free(doc_path);
+    const doc_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{doc_path});
+    defer allocator.free(doc_uri);
+
+    const text = try std.fs.cwd().readFileAlloc(allocator, doc_path, 1024);
+    defer allocator.free(text);
+    try server.workspace.upsertDocument(doc_uri, text);
+
+    const doc = server.workspace.getDocument(doc_uri).?;
+    try std.testing.expect(doc.links.len > 0);
+
+    const loc = try resolveLink(&server, doc, doc.links[0]);
+    try std.testing.expect(loc != null);
+    try std.testing.expect(std.mem.endsWith(u8, loc.?.uri, "My File.md"));
 }
 
 test "definition resolves relative paths with extension fallback" {
