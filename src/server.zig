@@ -2211,9 +2211,24 @@ fn buildInsertFootnoteAction(
     doc: index.Document,
     range: protocol.Range,
 ) !?[]const u8 {
-    if (!(range.start.line == range.end.line and range.start.character == range.end.character)) return null;
-    const id = try dateIdUtc(server.allocator);
-    defer server.allocator.free(id);
+    const selection = sliceForRange(doc.text, range);
+    const trimmed = std.mem.trim(u8, selection, " \t\r\n");
+    var id_owned: ?[]u8 = null;
+    defer if (id_owned) |buf| server.allocator.free(buf);
+
+    var id: []const u8 = "";
+    if (trimmed.len > 0) {
+        var buf: [64]u8 = undefined;
+        const slug = slugifyInto(trimmed, &buf);
+        if (slug.len > 0) {
+            id_owned = try server.allocator.dupe(u8, slug);
+            id = id_owned.?;
+        }
+    }
+    if (id.len == 0) {
+        id_owned = try dateIdUtc(server.allocator);
+        id = id_owned.?;
+    }
 
     const anchor = try std.fmt.allocPrint(server.allocator, "[^{s}]", .{id});
     defer server.allocator.free(anchor);
