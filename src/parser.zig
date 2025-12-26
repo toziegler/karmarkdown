@@ -5,6 +5,7 @@ const Snap = @import("snaptest.zig").Snap;
 
 pub const Backend = enum {
     simple,
+    resilient,
     tree_sitter,
 };
 
@@ -45,7 +46,7 @@ pub const ParsedDoc = struct {
 };
 
 pub const Parser = struct {
-    backend: Backend = .simple,
+    backend: Backend = .resilient,
 
     pub fn parse(
         self: *Parser,
@@ -55,6 +56,7 @@ pub const Parser = struct {
     ) !ParsedDoc {
         return switch (self.backend) {
             .simple => parseSimple(allocator, text, enable_wiki),
+            .resilient => parseResilient(allocator, text, enable_wiki),
             .tree_sitter => error.TreeSitterUnavailable,
         };
     }
@@ -332,6 +334,72 @@ fn parseSimple(allocator: std.mem.Allocator, text: []const u8, enable_wiki: bool
     };
 }
 
+fn parseResilient(allocator: std.mem.Allocator, text: []const u8, enable_wiki: bool) !ParsedDoc {
+    var tokens_list: std.ArrayList(Token) = .empty;
+    defer tokens_list.deinit(allocator);
+
+    var lexer = Lexer.init(text);
+    while (true) {
+        const tok = lexer.nextToken();
+        try tokens_list.append(allocator, tok);
+        if (tok.kind == .Eof) break;
+    }
+
+    var state = ParserState{
+        .allocator = allocator,
+        .input = text,
+        .tokens = tokens_list.items,
+        .index = 0,
+        .symbols = .empty,
+        .code_spans = &.{},
+        .inline_spans = &.{},
+        .headings = .empty,
+        .links = .empty,
+        .link_defs = .empty,
+        .enable_wiki = enable_wiki,
+    };
+    errdefer {
+        for (state.symbols.items) |sym| allocator.free(sym.name);
+        state.symbols.deinit(allocator);
+        state.headings.deinit(allocator);
+        state.links.deinit(allocator);
+        state.link_defs.deinit(allocator);
+    }
+
+    var lines: std.ArrayList(LineInfo) = .empty;
+    defer lines.deinit(allocator);
+    var line_iter = std.mem.splitScalar(u8, text, '\n');
+    var offset: usize = 0;
+    while (line_iter.next()) |line| {
+        const line_end_offset = offset + line.len;
+        try lines.append(allocator, .{
+            .text = line,
+            .offset = offset,
+            .end_offset = line_end_offset,
+        });
+        offset = line_end_offset + 1;
+    }
+
+    const code_spans = try scanCodeFenceSpans(allocator, lines.items, text);
+    defer allocator.free(code_spans);
+    state.code_spans = code_spans;
+
+    const inline_spans = try parseInlineCodeSpans(text, allocator);
+    defer allocator.free(inline_spans);
+    state.inline_spans = inline_spans;
+
+    parseBlocksResilient(&state, lines.items);
+    state.index = 0;
+    parseInlinePratt(&state);
+
+    return .{
+        .symbols = try state.symbols.toOwnedSlice(allocator),
+        .headings = try state.headings.toOwnedSlice(allocator),
+        .links = try state.links.toOwnedSlice(allocator),
+        .link_defs = try state.link_defs.toOwnedSlice(allocator),
+    };
+}
+
 fn parseFile(state: *ParserState) void {
     while (!at(state, .Eof)) {
         if (skipCodeSpan(state)) continue;
@@ -353,6 +421,329 @@ fn parseFile(state: *ParserState) void {
         }
         advanceWithError(state);
     }
+}
+
+fn scanCodeFenceSpans(
+    allocator: std.mem.Allocator,
+    lines: []const LineInfo,
+    text: []const u8,
+) ![]CodeSpan {
+    var spans: std.ArrayList(CodeSpan) = .empty;
+    errdefer spans.deinit(allocator);
+
+    var in_code = false;
+    var code_start_offset: usize = 0;
+
+    for (lines) |line| {
+        if (isCodeFence(line.text)) |_| {
+            if (!in_code) {
+                in_code = true;
+                code_start_offset = line.offset;
+            } else {
+                in_code = false;
+                try spans.append(allocator, .{ .start = code_start_offset, .end = line.end_offset });
+            }
+        }
+    }
+
+    if (in_code) {
+        const end_offset = if (lines.len == 0) 0 else text.len;
+        try spans.append(allocator, .{ .start = code_start_offset, .end = end_offset });
+    }
+
+    return spans.toOwnedSlice(allocator);
+}
+
+fn parseBlocksResilient(state: *ParserState, lines: []const LineInfo) void {
+    var in_code = false;
+    var code_start_line: usize = 0;
+    var code_lang: []const u8 = "";
+    var in_frontmatter = false;
+    var frontmatter_done = false;
+    var collecting_tags = false;
+
+    var line_index: usize = 0;
+    while (line_index < lines.len) : (line_index += 1) {
+        const line = lines[line_index].text;
+        const line_len = line.len;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        if (!frontmatter_done and line_index == 0 and std.mem.eql(u8, trimmed, "---")) {
+            in_frontmatter = true;
+            continue;
+        }
+
+        if (in_frontmatter) {
+            if (line_index > 0 and (std.mem.eql(u8, trimmed, "---") or std.mem.eql(u8, trimmed, "..."))) {
+                in_frontmatter = false;
+                frontmatter_done = true;
+                continue;
+            }
+            parseFrontmatterTagsLine(state, line, line_index, &collecting_tags) catch return;
+            continue;
+        }
+
+        if (isCodeFence(line)) |lang| {
+            if (!in_code) {
+                in_code = true;
+                code_start_line = line_index;
+                code_lang = lang;
+            } else {
+                in_code = false;
+                addCodeSymbol(
+                    state,
+                    code_lang,
+                    code_start_line,
+                    0,
+                    line_index,
+                    line_len,
+                ) catch return;
+            }
+            continue;
+        }
+
+        if (in_code) continue;
+
+        if (detectTable(lines, line_index)) |table| {
+            addTableSymbol(state, table.cols, table.rows, line_index, 0, table.end_char) catch return;
+            line_index = table.end_line;
+            continue;
+        }
+
+        if (parseLinkDef(line)) |link_def| {
+            state.link_defs.append(state.allocator, link_def) catch {};
+            if (findLinkDefStart(line)) |start_col| {
+                addReferenceDefSymbol(state, link_def.label, line_index, start_col, line_len) catch return;
+            }
+        }
+
+        if (listItemInfo(line)) |info| {
+            const item_text = if (info.text.len == 0) "-" else info.text;
+            addListItemSymbol(state, item_text, line_index, info.start_col, line_len) catch return;
+        }
+
+        parseHeadingLine(state, line, line_index);
+    }
+
+    if (in_code and lines.len > 0) {
+        const last_line = lines.len - 1;
+        const last_len = lines[last_line].text.len;
+        addCodeSymbol(state, code_lang, code_start_line, 0, last_line, last_len) catch return;
+    }
+}
+
+fn parseHeadingLine(state: *ParserState, line: []const u8, line_index: usize) void {
+    if (line.len == 0 or line[0] != '#') return;
+    var level: usize = 0;
+    while (level < line.len and level < 6 and line[level] == '#') : (level += 1) {}
+    if (level == 0) return;
+    const rest = line[level..];
+    const title = std.mem.trim(u8, rest, " \t");
+    if (title.len == 0) return;
+
+    const name = std.fmt.allocPrint(state.allocator, "H{d}: {s}", .{ level, title }) catch return;
+    errdefer state.allocator.free(name);
+    const range = protocol.Range{
+        .start = .{ .line = line_index, .character = 0 },
+        .end = .{ .line = line_index, .character = line.len },
+    };
+    addSymbol(state, name, range) catch return;
+    state.headings.append(state.allocator, .{
+        .level = @intCast(level),
+        .text = title,
+        .range = range,
+    }) catch {};
+}
+
+const InlineNodeKind = enum {
+    none,
+    other,
+    label,
+};
+
+const InlineNode = struct {
+    kind: InlineNodeKind,
+    start_offset: usize,
+    end_offset: usize,
+    start_pos: protocol.Position,
+    end_pos: protocol.Position,
+    is_marker: bool,
+    marker_text: []const u8,
+};
+
+fn parseInlinePratt(state: *ParserState) void {
+    while (!at(state, .Eof)) {
+        if (skipCodeSpan(state)) continue;
+        if (at(state, .Newline)) {
+            _ = bump(state);
+            continue;
+        }
+        parseInlineExpr(state);
+    }
+}
+
+fn parseInlineExpr(state: *ParserState) void {
+    var node = parseInlinePrimary(state);
+    if (node.kind == .none) {
+        advanceWithError(state);
+        return;
+    }
+
+    var consumed_postfix = false;
+    while (node.kind == .label) {
+        if (at(state, .LParen)) {
+            parseInlineLinkFromLabel(state, node, .inline_link);
+            consumed_postfix = true;
+            node.kind = .other;
+            break;
+        }
+        if (at(state, .LBracket)) {
+            parseInlineLinkFromLabel(state, node, .reference);
+            consumed_postfix = true;
+            node.kind = .other;
+            break;
+        }
+        break;
+    }
+
+    if (node.kind == .label and !consumed_postfix) {
+        if (node.is_marker) {
+            addProjectTagSymbol(state, node.marker_text, node.start_pos, node.end_pos) catch return;
+        } else {
+            addLinkSymbol(
+                state,
+                .reference,
+                node.start_offset,
+                node.end_offset,
+                node.start_pos,
+                node.end_pos,
+            ) catch return;
+        }
+    }
+}
+
+fn parseInlinePrimary(state: *ParserState) InlineNode {
+    if (at(state, .DoubleLBracket) and state.enable_wiki) {
+        const start_tok = current(state);
+        var end_offset = start_tok.end_offset;
+        var end_pos = start_tok.end;
+        _ = bump(state);
+        while (!at(state, .Eof) and !at(state, .Newline) and !at(state, .DoubleRBracket)) {
+            const tok = bump(state);
+            end_offset = tok.end_offset;
+            end_pos = tok.end;
+        }
+        if (at(state, .DoubleRBracket)) {
+            const close_tok = bump(state);
+            end_offset = close_tok.end_offset;
+            end_pos = close_tok.end;
+        } else {
+            recoverToLineEnd(state);
+        }
+        addLinkSymbol(state, .wiki, start_tok.start_offset, end_offset, start_tok.start, end_pos) catch {};
+        return .{
+            .kind = .other,
+            .start_offset = start_tok.start_offset,
+            .end_offset = end_offset,
+            .start_pos = start_tok.start,
+            .end_pos = end_pos,
+            .is_marker = false,
+            .marker_text = "",
+        };
+    }
+
+    if (at(state, .LBracket)) {
+        const start_tok = bump(state);
+        while (!at(state, .Eof) and !at(state, .Newline) and !at(state, .RBracket)) {
+            _ = bump(state);
+        }
+        if (!at(state, .RBracket)) {
+            recoverToLineEnd(state);
+            return .{
+                .kind = .none,
+                .start_offset = start_tok.start_offset,
+                .end_offset = start_tok.end_offset,
+                .start_pos = start_tok.start,
+                .end_pos = start_tok.end,
+                .is_marker = false,
+                .marker_text = "",
+            };
+        }
+        const close_tok = bump(state);
+        const label_raw = state.input[start_tok.end_offset..close_tok.start_offset];
+        const trimmed = std.mem.trim(u8, label_raw, " \t");
+        const is_marker = trimmed.len > 1 and trimmed[0] == '@';
+        return .{
+            .kind = .label,
+            .start_offset = start_tok.start_offset,
+            .end_offset = close_tok.end_offset,
+            .start_pos = start_tok.start,
+            .end_pos = close_tok.end,
+            .is_marker = is_marker,
+            .marker_text = trimmed,
+        };
+    }
+
+    const tok = bump(state);
+    return .{
+        .kind = .other,
+        .start_offset = tok.start_offset,
+        .end_offset = tok.end_offset,
+        .start_pos = tok.start,
+        .end_pos = tok.end,
+        .is_marker = false,
+        .marker_text = "",
+    };
+}
+
+fn parseInlineLinkFromLabel(state: *ParserState, node: InlineNode, kind: LinkKind) void {
+    const start_offset = node.start_offset;
+    const start_pos = node.start_pos;
+    var end_offset = node.end_offset;
+    var end_pos = node.end_pos;
+
+    if (kind == .inline_link) {
+        _ = bump(state);
+        while (!at(state, .Eof) and !at(state, .Newline) and !at(state, .RParen)) {
+            const tok = bump(state);
+            end_offset = tok.end_offset;
+            end_pos = tok.end;
+        }
+        if (at(state, .RParen)) {
+            const close_tok = bump(state);
+            end_offset = close_tok.end_offset;
+            end_pos = close_tok.end;
+        } else {
+            recoverToLineEnd(state);
+        }
+    } else {
+        _ = bump(state);
+        while (!at(state, .Eof) and !at(state, .Newline) and !at(state, .RBracket)) {
+            const tok = bump(state);
+            end_offset = tok.end_offset;
+            end_pos = tok.end;
+        }
+        if (at(state, .RBracket)) {
+            const close_tok = bump(state);
+            end_offset = close_tok.end_offset;
+            end_pos = close_tok.end;
+        } else {
+            recoverToLineEnd(state);
+        }
+    }
+
+    addLinkSymbol(state, kind, start_offset, end_offset, start_pos, end_pos) catch {};
+}
+
+fn addProjectTagSymbol(
+    state: *ParserState,
+    text: []const u8,
+    start: protocol.Position,
+    end: protocol.Position,
+) !void {
+    const name = try std.fmt.allocPrint(state.allocator, "ProjectTag: {s}", .{text});
+    errdefer state.allocator.free(name);
+    try addSymbol(state, name, protocol.Range{ .start = start, .end = end });
 }
 
 fn atHeadingStart(state: *ParserState) bool {
