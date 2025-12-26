@@ -404,6 +404,11 @@ fn parseHeading(state: *ParserState) void {
 
     if (level == 0 or level > 6) return;
 
+    if (last_hash.end_offset < line_end_offset) {
+        const next_ch = state.input[last_hash.end_offset];
+        if (next_ch != ' ' and next_ch != '\t') return;
+    }
+
     const title_slice = state.input[last_hash.end_offset..line_end_offset];
     const title = std.mem.trim(u8, title_slice, " \t");
     if (title.len == 0) return;
@@ -1028,6 +1033,7 @@ test "tags are symbols" {
     const input =
         \\# Heading
         \\Tag list: #one #two
+        \\#related
         \\`#skip`
         \\
     ;
@@ -1043,13 +1049,17 @@ test "tags are symbols" {
 
     var tag_one = false;
     var tag_two = false;
+    var tag_related = false;
     for (parsed.symbols) |sym| {
         if (std.mem.eql(u8, sym.name, "Tag: #one")) tag_one = true;
         if (std.mem.eql(u8, sym.name, "Tag: #two")) tag_two = true;
+        if (std.mem.eql(u8, sym.name, "Tag: #related")) tag_related = true;
         if (std.mem.eql(u8, sym.name, "Tag: #skip")) return error.TestUnexpectedTag;
+        if (std.mem.startsWith(u8, sym.name, "H1: related")) return error.TestUnexpectedHeading;
     }
     try std.testing.expect(tag_one);
     try std.testing.expect(tag_two);
+    try std.testing.expect(tag_related);
 }
 
 test "tasks are symbols" {
