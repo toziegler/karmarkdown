@@ -27,7 +27,7 @@ pub const Document = struct {
         allocator: std.mem.Allocator,
         uri: []const u8,
         text: []const u8,
-        doc_parser: parser.Parser,
+        doc_parser: *parser.Parser,
         enable_wiki: bool,
     ) !Document {
         const owned_text = try allocator.dupe(u8, text);
@@ -96,7 +96,7 @@ pub const Workspace = struct {
                 self.allocator,
                 entry.key_ptr.*,
                 text,
-                self.parser,
+                &self.parser,
                 self.config.wiki_links,
             );
             return;
@@ -106,7 +106,7 @@ pub const Workspace = struct {
             self.allocator,
             uri_owned,
             text,
-            self.parser,
+            &self.parser,
             self.config.wiki_links,
         );
         try self.docs.put(uri_owned, doc);
@@ -115,6 +115,12 @@ pub const Workspace = struct {
     pub fn getDocument(self: *Workspace, uri: []const u8) ?Document {
         if (self.docs.get(uri)) |doc| return doc;
         return null;
+    }
+
+    pub fn getDocumentPath(self: *Workspace, path: []const u8) ?Document {
+        const uri = pathToUri(self.allocator, path) catch return null;
+        defer self.allocator.free(uri);
+        return self.getDocument(uri);
     }
 
     pub fn removeDocument(self: *Workspace, uri: []const u8) void {
@@ -129,6 +135,10 @@ pub const Workspace = struct {
         if (self.hasRoot(root)) return;
         const owned = try self.allocator.dupe(u8, root);
         try self.roots.append(self.allocator, owned);
+    }
+
+    pub fn rootsSlice(self: *Workspace) []const []const u8 {
+        return self.roots.items;
     }
 
     pub fn indexRoots(self: *Workspace) !void {
@@ -159,6 +169,13 @@ pub const Workspace = struct {
             const owned = try self.allocator.dupe(u8, pattern);
             try self.config.excludes.append(self.allocator, owned);
         }
+    }
+
+    pub fn shouldIndexPath(self: *Workspace, path: []const u8) bool {
+        if (isExcluded(path, self.config.excludes.items)) return false;
+        if (!hasExtension(path, self.config.extensions.items)) return false;
+        if (!fileWithinSize(path, self.config.max_file_size_bytes)) return false;
+        return true;
     }
 
     fn hasRoot(self: *Workspace, root: []const u8) bool {
@@ -198,15 +215,21 @@ pub const Workspace = struct {
 
         while (try walker.next()) |entry| {
             if (entry.kind != .file) continue;
-            if (isExcluded(entry.path, self.config.excludes.items)) continue;
-            if (!hasExtension(entry.path, self.config.extensions.items)) continue;
-            if (!fileWithinSize(entry.path, self.config.max_file_size_bytes)) continue;
-            try self.upsertDocumentFromPath(entry.path);
+            const full_path = try std.fs.path.join(self.allocator, &.{ root, entry.path });
+            defer self.allocator.free(full_path);
+            if (isExcluded(full_path, self.config.excludes.items)) continue;
+            if (!hasExtension(full_path, self.config.extensions.items)) continue;
+            if (!fileWithinSize(full_path, self.config.max_file_size_bytes)) continue;
+            try self.upsertDocumentFromPath(full_path);
         }
     }
 
     pub fn upsertDocumentFromPath(self: *Workspace, path: []const u8) !void {
-        const text = try std.fs.readFileAlloc(self.allocator, path, self.config.max_file_size_bytes);
+        const text = try std.fs.cwd().readFileAlloc(
+            self.allocator,
+            path,
+            self.config.max_file_size_bytes,
+        );
         defer self.allocator.free(text);
         const uri = try pathToUri(self.allocator, path);
         defer self.allocator.free(uri);
@@ -247,6 +270,28 @@ test "workspace indexes markdown files in roots" {
     try ws.indexRoots();
 
     try std.testing.expect(ws.docs.count() == 2);
+}
+
+test "workspace indexing uses absolute file uris" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "doc.md", .data = "# Title\n" });
+
+    var ws = Workspace.init(std.testing.allocator);
+    defer ws.deinit();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    try ws.addRoot(root_path);
+    try ws.indexRoots();
+
+    var it = ws.docs.iterator();
+    const entry = it.next().?;
+    const expected_prefix = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{root_path});
+    defer std.testing.allocator.free(expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, entry.key_ptr.*, expected_prefix));
 }
 
 test "workspace remove document clears entry" {

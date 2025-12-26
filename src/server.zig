@@ -4,6 +4,7 @@ const protocol = @import("protocol.zig");
 const index = @import("index.zig");
 const parser = @import("parser.zig");
 const search = @import("search.zig");
+const watcher = @import("watcher.zig");
 const Snap = @import("snaptest.zig").Snap;
 
 const WorkspaceSymbolEntry = struct {
@@ -14,16 +15,19 @@ const WorkspaceSymbolEntry = struct {
 const Server = struct {
     allocator: std.mem.Allocator,
     workspace: index.Workspace,
+    watcher: ?watcher.Watcher,
 
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{
             .allocator = allocator,
             .workspace = index.Workspace.init(allocator),
+            .watcher = null,
         };
     }
 
     pub fn deinit(self: *Server) void {
         self.workspace.deinit();
+        if (self.watcher) |*w| w.deinit();
     }
 };
 
@@ -37,8 +41,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdin = &stdin_reader.interface;
     const stdout = &stdout_writer.interface;
+    const stdin_fd = std.fs.File.stdin().handle;
 
     while (true) {
+        if (server.watcher) |*w| {
+            try pollWatcher(&server, w, stdin_fd, stdout);
+        }
+
         const msg = try lsp.readMessage(allocator, stdin) orelse break;
         defer allocator.free(msg);
 
@@ -86,6 +95,44 @@ pub fn run(allocator: std.mem.Allocator) !void {
             if (std.mem.eql(u8, m, "textDocument/completion")) {
                 try handleCompletion(&server, stdout, root);
                 continue;
+            }
+        }
+    }
+}
+
+fn pollWatcher(
+    server: *Server,
+    w: *watcher.Watcher,
+    stdin_fd: std.fs.File.Handle,
+    writer: anytype,
+) !void {
+    const w_fd = w.fd() orelse return;
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = @intCast(stdin_fd), .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = w_fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    _ = try std.posix.poll(&fds, 0);
+
+    if ((fds[1].revents & std.posix.POLL.IN) != 0) {
+        const events = try w.readEvents(server.allocator);
+        defer {
+            for (events) |ev| server.allocator.free(ev.path);
+            server.allocator.free(events);
+        }
+        for (events) |ev| {
+            if (!server.workspace.shouldIndexPath(ev.path) and ev.kind != .delete) continue;
+            switch (ev.kind) {
+                .create, .modify => {
+                    try server.workspace.upsertDocumentFromPath(ev.path);
+                    if (server.workspace.getDocumentPath(ev.path)) |doc_val| {
+                        try publishDiagnostics(server, writer, doc_val);
+                    }
+                },
+                .delete => {
+                    const uri = try std.fmt.allocPrint(server.allocator, "file://{s}", .{ev.path});
+                    defer server.allocator.free(uri);
+                    server.workspace.removeDocument(uri);
+                },
             }
         }
     }
@@ -168,6 +215,16 @@ fn handleInitialize(server: *Server, root: std.json.Value) !void {
     }
 
     try server.workspace.indexRoots();
+    try startWatcher(server);
+}
+
+fn startWatcher(server: *Server) !void {
+    if (server.watcher != null) return;
+    var w = watcher.Watcher.init(server.allocator) catch return;
+    for (server.workspace.rootsSlice()) |root| {
+        w.addRoot(root) catch {};
+    }
+    server.watcher = w;
 }
 
 fn applyInitializationOptions(server: *Server, opts: std.json.Value) !void {
