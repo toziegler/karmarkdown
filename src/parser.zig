@@ -568,12 +568,6 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
     var code_lang: []const u8 = "";
     var code_start_char: usize = 0;
 
-    var list_active = false;
-    var list_start_line: usize = 0;
-    var list_start_offset: usize = 0;
-    var list_end_line: usize = 0;
-    var list_end_char: usize = 0;
-
     while (line_iter.next()) |line| : (line_index += 1) {
         const line_len = line.len;
         const line_end_offset = offset + line_len;
@@ -616,17 +610,9 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
 
         try addTagsFromLine(state, line, line_index, offset);
 
-        if (isListItem(line)) {
-            if (!list_active) {
-                list_active = true;
-                list_start_line = line_index;
-                list_start_offset = offset;
-            }
-            list_end_line = line_index;
-            list_end_char = line_len;
-        } else if (list_active) {
-            try addListSymbol(state, list_start_line, list_end_line, list_end_char);
-            list_active = false;
+        if (listItemInfo(line)) |info| {
+            const item_text = if (info.text.len == 0) "-" else info.text;
+            try addListItemSymbol(state, item_text, line_index, info.start_col, line_len);
         }
 
         offset = line_end_offset + 1;
@@ -644,10 +630,6 @@ fn parseBlocksFromLines(state: *ParserState) ![]CodeSpan {
             last_line_len,
         );
         try spans.append(state.allocator, .{ .start = code_start_offset, .end = state.input.len });
-    }
-
-    if (list_active) {
-        try addListSymbol(state, list_start_line, list_end_line, list_end_char);
     }
 
     return spans.toOwnedSlice(state.allocator);
@@ -704,16 +686,6 @@ fn isCodeFence(line: []const u8) ?[]const u8 {
     return null;
 }
 
-fn isListItem(line: []const u8) bool {
-    var i: usize = 0;
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
-    if (i >= line.len) return false;
-    if (line[i] == '-' and i + 1 < line.len and (line[i + 1] == ' ' or line[i + 1] == '\t')) {
-        return true;
-    }
-    return false;
-}
-
 fn addReferenceDefSymbol(
     state: *ParserState,
     label: []const u8,
@@ -729,26 +701,42 @@ fn addReferenceDefSymbol(
     });
 }
 
-fn addListSymbol(
-    state: *ParserState,
-    start_line: usize,
-    end_line: usize,
-    end_char: usize,
-) !void {
-    const name = try std.fmt.allocPrint(state.allocator, "List: -", .{});
-    errdefer state.allocator.free(name);
-    try addSymbol(state, name, protocol.Range{
-        .start = .{ .line = start_line, .character = 0 },
-        .end = .{ .line = end_line, .character = end_char },
-    });
-}
-
 fn findLinkDefStart(line: []const u8) ?usize {
     var i: usize = 0;
     while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
     if (i >= line.len) return null;
     if (line[i] != '[') return null;
     return i;
+}
+
+fn listItemInfo(line: []const u8) ?struct {
+    start_col: usize,
+    text: []const u8,
+} {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i >= line.len) return null;
+    if (line[i] != '-') return null;
+    if (i + 1 >= line.len or (line[i + 1] != ' ' and line[i + 1] != '\t')) return null;
+    var j = i + 1;
+    while (j < line.len and (line[j] == ' ' or line[j] == '\t')) : (j += 1) {}
+    const text = std.mem.trim(u8, line[j..], " \t");
+    return .{ .start_col = i, .text = text };
+}
+
+fn addListItemSymbol(
+    state: *ParserState,
+    text: []const u8,
+    line: usize,
+    start_char: usize,
+    end_char: usize,
+) !void {
+    const name = try std.fmt.allocPrint(state.allocator, "List: {s}", .{text});
+    errdefer state.allocator.free(name);
+    try addSymbol(state, name, protocol.Range{
+        .start = .{ .line = line, .character = start_char },
+        .end = .{ .line = line, .character = end_char },
+    });
 }
 
 fn addTagsFromLine(
@@ -988,7 +976,7 @@ test "list blocks and code fences are symbols" {
     var code_found = false;
     var heading_found = false;
     for (parsed.symbols) |sym| {
-        if (std.mem.eql(u8, sym.name, "List: -")) list_found = true;
+        if (std.mem.eql(u8, sym.name, "List: one")) list_found = true;
         if (std.mem.eql(u8, sym.name, "Code: zig")) code_found = true;
         if (std.mem.startsWith(u8, sym.name, "H1: Heading")) heading_found = true;
         if (std.mem.startsWith(u8, sym.name, "H1: not heading")) return error.TestUnexpectedHeading;
@@ -1094,7 +1082,8 @@ test "snapshot: mixed markdown symbols" {
 
     try snap(@src(),
         \\H1: Title @ 0:0-0:7
-        \\List: - @ 1:0-2:5
+        \\List: one @ 1:0-1:5
+        \\List: two @ 2:0-2:5
         \\Code: zig @ 4:0-7:3
         \\H2: Subtitle @ 8:0-8:11
         \\Link: [[Wiki Link]] @ 9:10-9:23

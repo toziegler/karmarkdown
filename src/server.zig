@@ -1085,9 +1085,17 @@ fn buildDocumentSymbols(
     }) = .empty;
     defer stack.deinit(allocator);
 
+    var list_stack: std.ArrayListUnmanaged(struct {
+        indent: usize,
+        list: *std.ArrayListUnmanaged(DocSymbol),
+        index: usize,
+    }) = .empty;
+    defer list_stack.deinit(allocator);
+
     for (entries.items) |entry| {
         switch (entry.kind) {
             .heading => {
+                list_stack.clearRetainingCapacity();
                 const heading = doc.headings[entry.index];
                 while (stack.items.len > 0 and heading.level <= stack.items[stack.items.len - 1].level) {
                     _ = stack.pop();
@@ -1116,19 +1124,47 @@ fn buildDocumentSymbols(
             },
             .block => {
                 const sym = doc.symbols[entry.index];
-                const target_list = if (stack.items.len == 0)
+                const base_list = if (stack.items.len == 0)
                     &roots
                 else
                     &stack.items[stack.items.len - 1]
                         .list.items[stack.items[stack.items.len - 1].index]
                         .children;
-                const node = DocSymbol{
-                    .name = sym.name,
-                    .kind = sym.kind,
-                    .range = sym.range,
-                    .selection_range = sym.range,
-                };
-                target_list.append(allocator, node) catch return &.{};
+
+                if (isListItemSymbol(sym)) {
+                    const indent = listItemIndent(doc.text, sym.range.start.line);
+                    while (list_stack.items.len > 0 and indent <= list_stack.items[list_stack.items.len - 1].indent) {
+                        _ = list_stack.pop();
+                    }
+                    const target_list = if (list_stack.items.len > 0)
+                        &list_stack.items[list_stack.items.len - 1]
+                            .list.items[list_stack.items[list_stack.items.len - 1].index]
+                            .children
+                    else
+                        base_list;
+                    const node = DocSymbol{
+                        .name = sym.name,
+                        .kind = sym.kind,
+                        .range = sym.range,
+                        .selection_range = sym.range,
+                    };
+                    target_list.append(allocator, node) catch return &.{};
+                    const idx = target_list.items.len - 1;
+                    list_stack.append(allocator, .{
+                        .indent = indent,
+                        .list = target_list,
+                        .index = idx,
+                    }) catch return &.{};
+                } else {
+                    list_stack.clearRetainingCapacity();
+                    const node = DocSymbol{
+                        .name = sym.name,
+                        .kind = sym.kind,
+                        .range = sym.range,
+                        .selection_range = sym.range,
+                    };
+                    base_list.append(allocator, node) catch return &.{};
+                }
             },
         }
     }
@@ -1159,11 +1195,24 @@ fn isDocSymbolEntry(sym: index.Symbol, headings: []parser.Heading) bool {
     const is_list = std.mem.startsWith(u8, sym.name, "List:");
     const is_code = std.mem.startsWith(u8, sym.name, "Code:");
     const is_link = std.mem.startsWith(u8, sym.name, "Link:");
-    if (!is_list and !is_code and !is_link) return false;
+    const is_ref = std.mem.startsWith(u8, sym.name, "Ref:");
+    const is_tag = std.mem.startsWith(u8, sym.name, "Tag:");
+    if (!is_list and !is_code and !is_link and !is_ref and !is_tag) return false;
     for (headings) |heading| {
         if (rangeEqual(sym.range, heading.range)) return false;
     }
     return true;
+}
+
+fn isListItemSymbol(sym: index.Symbol) bool {
+    return std.mem.startsWith(u8, sym.name, "List:");
+}
+
+fn listItemIndent(text: []const u8, line: usize) usize {
+    const line_slice = getLineSlice(text, .{ .line = line, .character = 0 });
+    var count: usize = 0;
+    while (count < line_slice.len and (line_slice[count] == ' ' or line_slice[count] == '\t')) : (count += 1) {}
+    return count;
 }
 
 fn freeDocSymbols(allocator: std.mem.Allocator, symbols: []DocSymbol) void {
@@ -1731,6 +1780,7 @@ test "snapshot: document symbol hierarchy" {
         \\# Title
         \\
         \\- [item](doc.md)
+        \\  - child
         \\- item2
         \\
         \\```zig
@@ -1751,7 +1801,9 @@ test "snapshot: document symbol hierarchy" {
     const snap = Snap.snap_fn(".");
     try snap(@src(),
         \\H1: Title
-        \\  List: -
+        \\  List: [item](doc.md)
+        \\    List: child
+        \\  List: item2
         \\  Link: [item](doc.md)
         \\  Code: zig
         \\  H2: Sub
