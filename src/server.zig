@@ -601,6 +601,48 @@ fn collectDiagnostics(server: *Server, doc: index.Document) ![]Diagnostic {
         });
     }
 
+    if (doc.headings.len > 1) {
+        var base_list: std.ArrayListUnmanaged(struct {
+            heading: parser.Heading,
+            base: []const u8,
+        }) = .empty;
+        defer {
+            for (base_list.items) |item| server.allocator.free(item.base);
+            base_list.deinit(server.allocator);
+        }
+
+        var counts = std.StringHashMap(usize).init(server.allocator);
+        defer counts.deinit();
+
+        for (doc.headings) |heading| {
+            var buf: [256]u8 = undefined;
+            const base = slugifyGfmBaseInto(heading.text, &buf);
+            if (base.len == 0) continue;
+            const base_owned = try server.allocator.dupe(u8, base);
+            try base_list.append(server.allocator, .{ .heading = heading, .base = base_owned });
+            if (counts.getEntry(base)) |entry| {
+                entry.value_ptr.* += 1;
+            } else {
+                try counts.put(base_owned, 1);
+            }
+        }
+
+        for (base_list.items) |item| {
+            const count = counts.get(item.base) orelse 0;
+            if (count <= 1) continue;
+            const message = try std.fmt.allocPrint(
+                server.allocator,
+                "Duplicate heading id: {s}",
+                .{item.base},
+            );
+            try list.append(server.allocator, .{
+                .range = item.heading.range,
+                .message = message,
+                .severity = 2,
+            });
+        }
+    }
+
     return list.toOwnedSlice(server.allocator);
 }
 
@@ -2045,6 +2087,29 @@ test "diagnostics report link issues" {
         \\Missing heading anchor @ 0:12-0:33
         \\Undefined link reference @ 0:34-0:46
     ).diff(rendered);
+}
+
+test "diagnostics report duplicate heading ids" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    const text =
+        \\# Title
+        \\# Title
+        \\
+    ;
+    try server.workspace.upsertDocument("file:///dup.md", text);
+    const doc = server.workspace.getDocument("file:///dup.md").?;
+
+    const diags = try collectDiagnostics(&server, doc);
+    defer {
+        for (diags) |diag| std.testing.allocator.free(diag.message);
+        std.testing.allocator.free(diags);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), diags.len);
+    try std.testing.expect(std.mem.startsWith(u8, diags[0].message, "Duplicate heading id:"));
+    try std.testing.expect(std.mem.startsWith(u8, diags[1].message, "Duplicate heading id:"));
 }
 
 test "config disables wiki links" {
