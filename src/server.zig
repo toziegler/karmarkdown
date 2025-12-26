@@ -345,8 +345,13 @@ fn handleDocumentSymbol(server: *Server, writer: anytype, root: std.json.Value) 
     if (uri_val != .string) return;
 
     const doc_opt = server.workspace.getDocument(uri_val.string);
-    const symbols = if (doc_opt) |doc_val| doc_val.symbols else &[_]index.Symbol{};
-    try sendSymbolResult(writer, root, uri_val.string, symbols);
+    if (doc_opt) |doc_val| {
+        const symbols = buildDocumentSymbols(server.allocator, doc_val);
+        defer freeDocSymbols(server.allocator, symbols);
+        try sendDocumentSymbolResult(writer, root, symbols);
+    } else {
+        try sendDocumentSymbolResult(writer, root, &.{});
+    }
 }
 
 fn handleWorkspaceSymbol(server: *Server, writer: anytype, root: std.json.Value) !void {
@@ -417,6 +422,14 @@ const Diagnostic = struct {
     severity: u8,
 };
 
+const DocSymbol = struct {
+    name: []const u8,
+    kind: protocol.SymbolKind,
+    range: protocol.Range,
+    selection_range: protocol.Range,
+    children: std.ArrayListUnmanaged(DocSymbol) = .empty,
+};
+
 const LinkIssue = enum {
     none,
     missing_reference,
@@ -476,6 +489,31 @@ fn sendSymbolResult(
     for (symbols, 0..) |sym, idx| {
         if (idx > 0) try out.writeByte(',');
         try writeSymbolInformation(out, uri, sym);
+    }
+    try out.writeAll("]}");
+
+    try lsp.writeMessage(writer, payload.items);
+}
+
+fn sendDocumentSymbolResult(
+    writer: anytype,
+    root: std.json.Value,
+    symbols: []const DocSymbol,
+) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.heap.page_allocator);
+
+    var out = payload.writer(std.heap.page_allocator);
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    if (getId(root)) |id_val| {
+        try writeJsonValue(out, id_val);
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"result\":[");
+    for (symbols, 0..) |sym, idx| {
+        if (idx > 0) try out.writeByte(',');
+        try writeDocumentSymbol(out, sym);
     }
     try out.writeAll("]}");
 
@@ -737,6 +775,39 @@ fn writeSymbolInformation(
     try writer.writeAll("}}}}");
 }
 
+fn writeDocumentSymbol(writer: anytype, sym: DocSymbol) !void {
+    try writer.writeAll("{\"name\":");
+    try protocol.writeJsonString(writer, sym.name);
+    try writer.writeAll(",\"kind\":");
+    try writer.print("{d}", .{@intFromEnum(sym.kind)});
+    try writer.writeAll(",\"range\":{\"start\":{\"line\":");
+    try writer.print("{d}", .{sym.range.start.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{sym.range.start.character});
+    try writer.writeAll("},\"end\":{\"line\":");
+    try writer.print("{d}", .{sym.range.end.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{sym.range.end.character});
+    try writer.writeAll("}},\"selectionRange\":{\"start\":{\"line\":");
+    try writer.print("{d}", .{sym.selection_range.start.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{sym.selection_range.start.character});
+    try writer.writeAll("},\"end\":{\"line\":");
+    try writer.print("{d}", .{sym.selection_range.end.line});
+    try writer.writeAll(",\"character\":");
+    try writer.print("{d}", .{sym.selection_range.end.character});
+    try writer.writeAll("}}");
+    if (sym.children.items.len > 0) {
+        try writer.writeAll(",\"children\":[");
+        for (sym.children.items, 0..) |child, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            try writeDocumentSymbol(writer, child);
+        }
+        try writer.writeAll("]");
+    }
+    try writer.writeAll("}");
+}
+
 fn writeLocation(writer: anytype, location: protocol.Location) !void {
     try writer.writeAll("{\"uri\":");
     try protocol.writeJsonString(writer, location.uri);
@@ -907,6 +978,156 @@ fn appendHeadingCompletions(
         else
             try std.fmt.allocPrint(allocator, "{s}", .{heading.text});
         try items.append(allocator, .{ .label = label });
+    }
+}
+
+fn buildDocumentSymbols(
+    allocator: std.mem.Allocator,
+    doc: index.Document,
+) []DocSymbol {
+    var roots: std.ArrayListUnmanaged(DocSymbol) = .empty;
+    errdefer {
+        freeDocSymbolSlice(allocator, roots.items);
+        roots.deinit(allocator);
+    }
+
+    const EntryKind = enum { heading, block };
+    const Entry = struct {
+        kind: EntryKind,
+        line: usize,
+        order: usize,
+        index: usize,
+    };
+
+    var entries: std.ArrayListUnmanaged(Entry) = .empty;
+    defer entries.deinit(allocator);
+
+    var order: usize = 0;
+    for (doc.headings, 0..) |heading, idx| {
+        entries.append(allocator, .{
+            .kind = .heading,
+            .line = heading.range.start.line,
+            .order = order,
+            .index = idx,
+        }) catch return &.{};
+        order += 1;
+    }
+
+    for (doc.symbols, 0..) |sym, idx| {
+        if (!isBlockSymbol(sym, doc.headings)) continue;
+        entries.append(allocator, .{
+            .kind = .block,
+            .line = sym.range.start.line,
+            .order = order,
+            .index = idx,
+        }) catch return &.{};
+        order += 1;
+    }
+
+    std.sort.heap(Entry, entries.items, {}, struct {
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            if (a.line == b.line) return a.order < b.order;
+            return a.line < b.line;
+        }
+    }.lessThan);
+
+    var stack: std.ArrayListUnmanaged(struct {
+        list: *std.ArrayListUnmanaged(DocSymbol),
+        index: usize,
+        level: u8,
+    }) = .empty;
+    defer stack.deinit(allocator);
+
+    for (entries.items) |entry| {
+        switch (entry.kind) {
+            .heading => {
+                const heading = doc.headings[entry.index];
+                while (stack.items.len > 0 and heading.level <= stack.items[stack.items.len - 1].level) {
+                    _ = stack.pop();
+                }
+
+                const target_list = if (stack.items.len == 0)
+                    &roots
+                else
+                    &stack.items[stack.items.len - 1]
+                        .list.items[stack.items[stack.items.len - 1].index]
+                        .children;
+
+                const node = DocSymbol{
+                    .name = headingSymbolName(doc, heading),
+                    .kind = .String,
+                    .range = heading.range,
+                    .selection_range = heading.range,
+                };
+                target_list.append(allocator, node) catch return &.{};
+                const idx = target_list.items.len - 1;
+                stack.append(allocator, .{
+                    .list = target_list,
+                    .index = idx,
+                    .level = heading.level,
+                }) catch return &.{};
+            },
+            .block => {
+                const sym = doc.symbols[entry.index];
+                const target_list = if (stack.items.len == 0)
+                    &roots
+                else
+                    &stack.items[stack.items.len - 1]
+                        .list.items[stack.items[stack.items.len - 1].index]
+                        .children;
+                const node = DocSymbol{
+                    .name = sym.name,
+                    .kind = sym.kind,
+                    .range = sym.range,
+                    .selection_range = sym.range,
+                };
+                target_list.append(allocator, node) catch return &.{};
+            },
+        }
+    }
+
+    const out = roots.toOwnedSlice(allocator) catch {
+        freeDocSymbolSlice(allocator, roots.items);
+        roots.deinit(allocator);
+        return &.{};
+    };
+    return out;
+}
+
+fn headingSymbolName(doc: index.Document, heading: parser.Heading) []const u8 {
+    for (doc.symbols) |sym| {
+        if (rangeEqual(sym.range, heading.range) and std.mem.startsWith(u8, sym.name, "H")) {
+            return sym.name;
+        }
+    }
+    return heading.text;
+}
+
+fn rangeEqual(a: protocol.Range, b: protocol.Range) bool {
+    return a.start.line == b.start.line and a.start.character == b.start.character and
+        a.end.line == b.end.line and a.end.character == b.end.character;
+}
+
+fn isBlockSymbol(sym: index.Symbol, headings: []parser.Heading) bool {
+    if (!std.mem.startsWith(u8, sym.name, "List:") and !std.mem.startsWith(u8, sym.name, "Code:")) {
+        return false;
+    }
+    for (headings) |heading| {
+        if (rangeEqual(sym.range, heading.range)) return false;
+    }
+    return true;
+}
+
+fn freeDocSymbols(allocator: std.mem.Allocator, symbols: []DocSymbol) void {
+    if (symbols.len == 0) return;
+    freeDocSymbolSlice(allocator, symbols);
+    allocator.free(symbols);
+}
+
+fn freeDocSymbolSlice(allocator: std.mem.Allocator, symbols: []DocSymbol) void {
+    for (symbols) |*sym| {
+        freeDocSymbolSlice(allocator, sym.children.items);
+        sym.children.deinit(allocator);
     }
 }
 
@@ -1143,21 +1364,36 @@ test "document symbol response is valid JSON" {
     try obj.put("id", std.json.Value{ .integer = 1 });
 
     const root = std.json.Value{ .object = obj };
-    const symbols = [_]index.Symbol{
-        .{
-            .name = try allocator.dupe(u8, "H1: Title"),
-            .kind = .String,
-            .range = .{
-                .start = .{ .line = 0, .character = 0 },
-                .end = .{ .line = 0, .character = 8 },
-            },
+    var root_sym = DocSymbol{
+        .name = "H1: Title",
+        .kind = .String,
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 8 },
+        },
+        .selection_range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 8 },
         },
     };
-    defer allocator.free(symbols[0].name);
+    try root_sym.children.append(allocator, .{
+        .name = "List: -",
+        .kind = .String,
+        .range = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 3, .character = 6 },
+        },
+        .selection_range = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 3, .character = 6 },
+        },
+    });
+    defer root_sym.children.deinit(allocator);
+    const symbols = [_]DocSymbol{root_sym};
 
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    try sendSymbolResult(&out.writer, root, "file:///test.md", &symbols);
+    try sendDocumentSymbolResult(&out.writer, root, &symbols);
     const payload = try out.toOwnedSlice();
     defer allocator.free(payload);
 
@@ -1211,29 +1447,77 @@ test "snapshot: document symbol response" {
     try obj.put("id", std.json.Value{ .integer = 1 });
 
     const root = std.json.Value{ .object = obj };
-    const symbols = [_]index.Symbol{
-        .{
-            .name = try allocator.dupe(u8, "H1: Title"),
-            .kind = .String,
-            .range = .{
-                .start = .{ .line = 0, .character = 0 },
-                .end = .{ .line = 0, .character = 8 },
-            },
+    var root_sym = DocSymbol{
+        .name = "H1: Title",
+        .kind = .String,
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 8 },
+        },
+        .selection_range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 8 },
         },
     };
-    defer allocator.free(symbols[0].name);
+    try root_sym.children.append(allocator, .{
+        .name = "Code: zig",
+        .kind = .String,
+        .range = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 4, .character = 3 },
+        },
+        .selection_range = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 4, .character = 3 },
+        },
+    });
+    defer root_sym.children.deinit(allocator);
+    const symbols = [_]DocSymbol{root_sym};
 
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    try sendSymbolResult(&out.writer, root, "file:///test.md", &symbols);
+    try sendDocumentSymbolResult(&out.writer, root, &symbols);
     const message = try out.toOwnedSlice();
     defer allocator.free(message);
 
     const payload = extractPayload(message) orelse return error.TestExpectedPayload;
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\{"jsonrpc":"2.0","id":1,"result":[{"name":"H1: Title","kind":15,"location":{"uri":"file:///test.md","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}}}}]}
+        \\{"jsonrpc":"2.0","id":1,"result":[{"name":"H1: Title","kind":15,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"selectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"children":[{"name":"Code: zig","kind":15,"range":{"start":{"line":2,"character":0},"end":{"line":4,"character":3}},"selectionRange":{"start":{"line":2,"character":0},"end":{"line":4,"character":3}}}]}]}
     ).diff(payload);
+}
+
+test "snapshot: document symbol hierarchy" {
+    const allocator = std.testing.allocator;
+    var parser_instance = parser.Parser{};
+    const text =
+        \\# Title
+        \\
+        \\- item
+        \\- item2
+        \\
+        \\```zig
+        \\let x = 1;
+        \\```
+        \\
+        \\## Sub
+        \\
+    ;
+    var doc = try index.Document.init(allocator, "file:///doc.md", text, &parser_instance, true);
+    defer doc.deinit(allocator);
+
+    const symbols = buildDocumentSymbols(allocator, doc);
+    defer freeDocSymbols(allocator, symbols);
+    const rendered = try renderDocSymbols(allocator, symbols);
+    defer allocator.free(rendered);
+
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\H1: Title
+        \\  List: -
+        \\  Code: zig
+        \\  H2: Sub
+    ).diff(rendered);
 }
 
 test "snapshot: workspace symbol response" {
@@ -1274,6 +1558,26 @@ fn extractPayload(message: []const u8) ?[]const u8 {
     const marker = "\r\n\r\n";
     const idx = std.mem.indexOf(u8, message, marker) orelse return null;
     return message[idx + marker.len ..];
+}
+
+fn renderDocSymbols(allocator: std.mem.Allocator, symbols: []DocSymbol) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var writer = out.writer(allocator);
+    for (symbols) |sym| {
+        try renderDocSymbolLine(&writer, sym, 0);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderDocSymbolLine(writer: anytype, sym: DocSymbol, depth: usize) !void {
+    for (0..depth) |_| {
+        try writer.writeAll("  ");
+    }
+    try writer.print("{s}\n", .{sym.name});
+    for (sym.children.items) |child| {
+        try renderDocSymbolLine(writer, child, depth + 1);
+    }
 }
 
 test "snapshot: definition response" {
