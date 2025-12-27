@@ -61,8 +61,16 @@ pub const Workspace = struct {
 
     pub fn init(allocator: std.mem.Allocator) Workspace {
         var ext_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        ext_list.append(allocator, ".md") catch {};
-        ext_list.append(allocator, ".markdown") catch {};
+        if (allocator.dupe(u8, ".md")) |owned| {
+            ext_list.append(allocator, owned) catch {
+                allocator.free(owned);
+            };
+        } else |_| {}
+        if (allocator.dupe(u8, ".markdown")) |owned| {
+            ext_list.append(allocator, owned) catch {
+                allocator.free(owned);
+            };
+        } else |_| {}
         return .{
             .allocator = allocator,
             .docs = std.StringHashMap(Document).init(allocator),
@@ -219,7 +227,13 @@ pub const Workspace = struct {
         var walker = try dir.walk(self.allocator);
         defer walker.deinit();
 
-        while (try walker.next()) |entry| {
+        while (true) {
+            const entry_opt = walker.next() catch |err| switch (err) {
+                error.AccessDenied, error.FileNotFound => continue,
+                else => return err,
+            };
+            if (entry_opt == null) break;
+            const entry = entry_opt.?;
             if (entry.kind != .file) continue;
             const full_path = try std.fs.path.join(self.allocator, &.{ root, entry.path });
             defer self.allocator.free(full_path);
@@ -237,7 +251,13 @@ pub const Workspace = struct {
         var walker = try dir.walk(self.allocator);
         defer walker.deinit();
 
-        while (try walker.next()) |entry| {
+        while (true) {
+            const entry_opt = walker.next() catch |err| switch (err) {
+                error.AccessDenied, error.FileNotFound => continue,
+                else => return err,
+            };
+            if (entry_opt == null) break;
+            const entry = entry_opt.?;
             if (entry.kind != .file) continue;
             const full_path = try std.fs.path.join(self.allocator, &.{ root, entry.path });
             defer self.allocator.free(full_path);

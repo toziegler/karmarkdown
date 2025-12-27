@@ -525,10 +525,8 @@ fn handleCodeAction(server: *Server, writer: anytype, root: std.json.Value) !voi
         try actions.append(server.allocator, action);
     }
 
-    if (range.start.line == range.end.line and range.start.character == range.end.character) {
-        if (try buildInsertNewNoteLinkAction(server, doc_opt, range)) |action| {
-            try actions.append(server.allocator, action);
-        }
+    if (try buildInsertNewNoteLinkAction(server, doc_opt, range)) |action| {
+        try actions.append(server.allocator, action);
     }
 
     if (try buildInsertFootnoteAction(server, doc_opt, range)) |action| {
@@ -3333,7 +3331,7 @@ test "snapshot: code action extract selection" {
     const payload = extractPayload(message) orelse return error.TestExpectedPayload;
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\{"jsonrpc":"2.0","id":23,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Line one\n\nLine one\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"[Line one](<snap:ignore>.md)"}]}]}}]}
+        \\{"jsonrpc":"2.0","id":23,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Line one\n\nLine one\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"[Line one](<snap:ignore>.md)"}]}]}},{"title":"Insert new note link","kind":"refactor","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Line one\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"[Line one](<snap:ignore>.md)"}]}]}}]}
     ).diff(payload);
 }
 
@@ -3370,7 +3368,7 @@ test "snapshot: code action csv to table" {
     const payload = extractPayload(message) orelse return error.TestExpectedPayload;
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\{"jsonrpc":"2.0","id":28,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Name,Age\n\nName,Age\nAlice,30\nBob,40\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"[Name,Age](<snap:ignore>.md)"}]}]}},{"title":"Convert CSV to table","kind":"quickfix","edit":{"changes":{"file:///root/a.md":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"| Name  | Age |\n| ----- | --- |\n| Alice | 30  |\n| Bob   | 40  |\n"}]}}}]}
+        \\{"jsonrpc":"2.0","id":28,"result":[{"title":"Extract selection to note","kind":"refactor.extract","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Name,Age\n\nName,Age\nAlice,30\nBob,40\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"[Name,Age](<snap:ignore>.md)"}]}]}},{"title":"Convert CSV to table","kind":"quickfix","edit":{"changes":{"file:///root/a.md":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"| Name  | Age |\n| ----- | --- |\n| Alice | 30  |\n| Bob   | 40  |\n"}]}}},{"title":"Insert new note link","kind":"refactor","edit":{"documentChanges":[{"kind":"create","uri":"file:///root/<snap:ignore>.md"},{"textDocument":{"uri":"file:///root/<snap:ignore>.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"# Name,Age\n"}]},{"textDocument":{"uri":"file:///root/a.md","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":6}},"newText":"[Name,Age](<snap:ignore>.md)"}]}]}}]}
     ).diff(payload);
 }
 
