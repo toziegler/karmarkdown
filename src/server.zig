@@ -1154,7 +1154,11 @@ fn appendPathCompletions(
     const doc_path = uriToPath(allocator, doc.uri) orelse return;
     defer allocator.free(doc_path);
     const doc_dir = std.fs.path.dirname(doc_path) orelse doc_path;
-    const title_query = pathQueryFromPrefix(prefix);
+    const parts = pathPrefixParts(prefix);
+    const dir_prefix = normalizePathPrefix(parts.dir_prefix);
+    const match_prefix = normalizePathPrefix(prefix);
+    const title_query = parts.query;
+    const lead = pathLeadingPrefix(prefix);
 
     var it = server.workspace.docs.iterator();
     while (it.next()) |entry| {
@@ -1162,18 +1166,26 @@ fn appendPathCompletions(
         defer allocator.free(path);
         const rel = std.fs.path.relative(allocator, doc_dir, path) catch continue;
         defer allocator.free(rel);
-        if (startsWithIgnoreCase(rel, prefix)) {
+        if (dir_prefix.len > 0 and !startsWithIgnoreCase(rel, dir_prefix)) continue;
+        if (startsWithIgnoreCase(rel, match_prefix)) {
             const label = try allocator.dupe(u8, rel);
-            try items.append(allocator, .{ .label = label });
+            const insert_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
+            try items.append(allocator, .{
+                .label = label,
+                .insert_text = insert_text,
+            });
         }
-        if (title_query.len == 0) continue;
 
         const title = documentTitle(allocator, entry.value_ptr.*, entry.key_ptr.*) catch continue;
         defer allocator.free(title);
-        if (!containsIgnoreCase(title, title_query)) continue;
+        if (title_query.len == 0) {
+            if (dir_prefix.len == 0) continue;
+        } else if (!containsIgnoreCase(title, title_query)) {
+            continue;
+        }
 
-        const label = try std.fmt.allocPrint(allocator, "{s} - {s}", .{ title, rel });
-        const insert_text = try allocator.dupe(u8, rel);
+        const label = try allocator.dupe(u8, title);
+        const insert_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
         try items.append(allocator, .{
             .label = label,
             .insert_text = insert_text,
@@ -1466,21 +1478,26 @@ fn containsIgnoreCase(text: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn pathQueryFromPrefix(prefix: []const u8) []const u8 {
-    if (prefix.len == 0) return "";
-    var tail = prefix;
-    if (std.mem.lastIndexOfScalar(u8, tail, '/')) |idx| {
-        if (idx + 1 < tail.len) tail = tail[idx + 1 ..];
+fn pathPrefixParts(prefix: []const u8) struct { dir_prefix: []const u8, query: []const u8 } {
+    if (prefix.len == 0) return .{ .dir_prefix = "", .query = "" };
+    if (std.mem.lastIndexOfAny(u8, prefix, "/\\")) |idx| {
+        const dir_prefix = prefix[0 .. idx + 1];
+        const query = if (idx + 1 < prefix.len) prefix[idx + 1 ..] else "";
+        return .{ .dir_prefix = dir_prefix, .query = query };
     }
-    if (std.mem.lastIndexOfScalar(u8, tail, '\\')) |idx| {
-        if (idx + 1 < tail.len) tail = tail[idx + 1 ..];
-    }
-    if (std.mem.startsWith(u8, tail, "./")) {
-        tail = tail[2..];
-    } else if (std.mem.startsWith(u8, tail, ".\\")) {
-        tail = tail[2..];
-    }
-    return tail;
+    return .{ .dir_prefix = "", .query = prefix };
+}
+
+fn normalizePathPrefix(prefix: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, prefix, "./")) return prefix[2..];
+    if (std.mem.startsWith(u8, prefix, ".\\")) return prefix[2..];
+    return prefix;
+}
+
+fn pathLeadingPrefix(prefix: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, prefix, "./")) return "./";
+    if (std.mem.startsWith(u8, prefix, ".\\")) return ".\\";
+    return "";
 }
 
 fn lowerAscii(ch: u8) u8 {
@@ -4080,7 +4097,7 @@ test "completion suggests wiki, paths, and headings" {
     const rendered_path_title = try renderCompletions(std.testing.allocator, items.items);
     defer std.testing.allocator.free(rendered_path_title);
     try snap(@src(),
-        \\Allocator - zk/allocator.md
+        \\Allocator
         \\zk/allocator.md
     ).diff(rendered_path_title);
 }
