@@ -1154,6 +1154,7 @@ fn appendPathCompletions(
     const doc_path = uriToPath(allocator, doc.uri) orelse return;
     defer allocator.free(doc_path);
     const doc_dir = std.fs.path.dirname(doc_path) orelse doc_path;
+    const title_query = pathQueryFromPrefix(prefix);
 
     var it = server.workspace.docs.iterator();
     while (it.next()) |entry| {
@@ -1165,11 +1166,11 @@ fn appendPathCompletions(
             const label = try allocator.dupe(u8, rel);
             try items.append(allocator, .{ .label = label });
         }
-        if (prefix.len == 0) continue;
+        if (title_query.len == 0) continue;
 
         const title = documentTitle(allocator, entry.value_ptr.*, entry.key_ptr.*) catch continue;
         defer allocator.free(title);
-        if (!containsIgnoreCase(title, prefix)) continue;
+        if (!containsIgnoreCase(title, title_query)) continue;
 
         const label = try std.fmt.allocPrint(allocator, "{s} - {s}", .{ title, rel });
         const insert_text = try allocator.dupe(u8, rel);
@@ -1463,6 +1464,23 @@ fn containsIgnoreCase(text: []const u8, needle: []const u8) bool {
         if (j == needle.len) return true;
     }
     return false;
+}
+
+fn pathQueryFromPrefix(prefix: []const u8) []const u8 {
+    if (prefix.len == 0) return "";
+    var tail = prefix;
+    if (std.mem.lastIndexOfScalar(u8, tail, '/')) |idx| {
+        if (idx + 1 < tail.len) tail = tail[idx + 1 ..];
+    }
+    if (std.mem.lastIndexOfScalar(u8, tail, '\\')) |idx| {
+        if (idx + 1 < tail.len) tail = tail[idx + 1 ..];
+    }
+    if (std.mem.startsWith(u8, tail, "./")) {
+        tail = tail[2..];
+    } else if (std.mem.startsWith(u8, tail, ".\\")) {
+        tail = tail[2..];
+    }
+    return tail;
 }
 
 fn lowerAscii(ch: u8) u8 {
@@ -3996,11 +4014,15 @@ test "completion suggests wiki, paths, and headings" {
 
     try server.workspace.upsertDocument(
         "file:///root/dir/a.md",
-        "[[b\n[Link](b.md#he)\n[Title](He\n# Heading One\n## Heading Two\n",
+        "[[b\n[Link](b.md#he)\n[Title](He\n[Path](./zk/alloc\n# Heading One\n## Heading Two\n",
     );
     try server.workspace.upsertDocument(
         "file:///root/dir/b.md",
         "## Heading Two\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/allocator.md",
+        "# Allocator\n",
     );
 
     const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
@@ -4051,6 +4073,16 @@ test "completion suggests wiki, paths, and headings" {
         \\Heading One - a.md
         \\Heading Two - b.md
     ).diff(rendered_title_path);
+
+    items.clearRetainingCapacity();
+    try collectCompletions(&server, doc_a, .{ .line = 3, .character = 14 }, &items);
+    sortCompletionItems(items.items);
+    const rendered_path_title = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered_path_title);
+    try snap(@src(),
+        \\Allocator - zk/allocator.md
+        \\zk/allocator.md
+    ).diff(rendered_path_title);
 }
 
 test "completion suggests snippets" {
