@@ -4653,6 +4653,63 @@ test "didOpen adds root for out-of-root documents" {
     try std.testing.expect(server.workspace.docs.count() >= 2);
 }
 
+test "completion finds subfolder notes after didOpen adds root" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("zk");
+    try tmp.dir.writeFile(.{ .sub_path = "zk/allocator.md", .data = "# Allocator\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "note.md", .data = "[Link](./zk/All\n" });
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const doc_path = try std.fs.path.join(allocator, &.{ root_path, "note.md" });
+    defer allocator.free(doc_path);
+    const doc_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{doc_path});
+    defer allocator.free(doc_uri);
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = doc_uri });
+    try text_doc.put("text", std.json.Value{ .string = "[Link](./zk/All\n" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleDidOpen(&server, &out.writer, root);
+
+    const doc = server.workspace.getDocument(doc_uri).?;
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| {
+            allocator.free(item.label);
+            if (item.insert_text) |text| allocator.free(text);
+            if (item.filter_text) |text| allocator.free(text);
+            if (item.detail) |text| allocator.free(text);
+        }
+        items.deinit(allocator);
+    }
+
+    try collectCompletions(&server, doc, .{ .line = 0, .character = 13 }, &items);
+    sortCompletionItems(items.items);
+    const rendered = try renderCompletions(allocator, items.items);
+    defer allocator.free(rendered);
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\Allocator
+        \\zk/allocator.md
+    ).diff(rendered);
+}
+
 test "fuzz: symbol JSON is valid" {
     const Context = struct {
         fn testOne(_: @This(), input: []const u8) anyerror!void {
