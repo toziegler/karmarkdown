@@ -423,6 +423,7 @@ const CompletionItem = struct {
     label: []const u8,
     insert_text: ?[]const u8 = null,
     insert_text_format: ?u8 = null,
+    filter_text: ?[]const u8 = null,
 };
 
 const Diagnostic = struct {
@@ -472,6 +473,7 @@ fn handleCompletion(server: *Server, writer: anytype, root: std.json.Value) !voi
         for (items.items) |item| {
             server.allocator.free(item.label);
             if (item.insert_text) |text| server.allocator.free(text);
+            if (item.filter_text) |text| server.allocator.free(text);
         }
         items.deinit(server.allocator);
     }
@@ -612,6 +614,10 @@ fn sendCompletionResult(
         if (idx > 0) try out.writeByte(',');
         try out.writeAll("{\"label\":");
         try protocol.writeJsonString(out, item.label);
+        if (item.filter_text) |filter_text| {
+            try out.writeAll(",\"filterText\":");
+            try protocol.writeJsonString(out, filter_text);
+        }
         if (item.insert_text) |insert_text| {
             try out.writeAll(",\"insertText\":");
             try protocol.writeJsonString(out, insert_text);
@@ -1170,9 +1176,11 @@ fn appendPathCompletions(
         if (startsWithIgnoreCase(rel, match_prefix)) {
             const label = try allocator.dupe(u8, rel);
             const insert_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
+            const filter_text = if (prefix.len > 0) try allocator.dupe(u8, prefix) else null;
             try items.append(allocator, .{
                 .label = label,
                 .insert_text = insert_text,
+                .filter_text = filter_text,
             });
         }
 
@@ -1186,9 +1194,11 @@ fn appendPathCompletions(
 
         const label = try allocator.dupe(u8, title);
         const insert_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
+        const filter_text = if (prefix.len > 0) try allocator.dupe(u8, prefix) else null;
         try items.append(allocator, .{
             .label = label,
             .insert_text = insert_text,
+            .filter_text = filter_text,
         });
     }
 }
@@ -4069,6 +4079,7 @@ test "completion suggests wiki, paths, and headings" {
         for (items.items) |item| {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
+            if (item.filter_text) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4123,6 +4134,206 @@ test "completion suggests wiki, paths, and headings" {
     ).diff(rendered_path_title);
 }
 
+test "completion sets filterText for title path matches" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "[Path](./zk/alloc\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/allocator.md",
+        "# Allocator\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| {
+            std.testing.allocator.free(item.label);
+            if (item.insert_text) |text| std.testing.allocator.free(text);
+            if (item.filter_text) |text| std.testing.allocator.free(text);
+        }
+        items.deinit(std.testing.allocator);
+    }
+
+    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 14 }, &items);
+
+    var found = false;
+    for (items.items) |item| {
+        if (!std.mem.eql(u8, item.label, "Allocator")) continue;
+        found = true;
+        try std.testing.expect(item.filter_text != null);
+        try std.testing.expect(std.mem.eql(u8, item.filter_text.?, "./zk/alloc"));
+        try std.testing.expect(item.insert_text != null);
+        try std.testing.expect(std.mem.eql(u8, item.insert_text.?, "./zk/allocator.md"));
+    }
+    try std.testing.expect(found);
+}
+
+test "completion matches multiple titles by query" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "[Path](./zk/alloc\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/semantics.md",
+        "# Allocator Semantics\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/group.md",
+        "# Grouping Allocations\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| {
+            std.testing.allocator.free(item.label);
+            if (item.insert_text) |text| std.testing.allocator.free(text);
+            if (item.filter_text) |text| std.testing.allocator.free(text);
+        }
+        items.deinit(std.testing.allocator);
+    }
+
+    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 14 }, &items);
+    sortCompletionItems(items.items);
+    const rendered = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered);
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\Allocator Semantics
+        \\Grouping Allocations
+    ).diff(rendered);
+}
+
+test "completion matches titles by directory prefix only" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "[Path](./zk/\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/semantics.md",
+        "# Allocator Semantics\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/group.md",
+        "# Grouping Allocations\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/other.md",
+        "# Outside\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| {
+            std.testing.allocator.free(item.label);
+            if (item.insert_text) |text| std.testing.allocator.free(text);
+            if (item.filter_text) |text| std.testing.allocator.free(text);
+        }
+        items.deinit(std.testing.allocator);
+    }
+
+    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 12 }, &items);
+    sortCompletionItems(items.items);
+    const rendered = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered);
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\Allocator Semantics
+        \\Grouping Allocations
+        \\zk/group.md
+        \\zk/semantics.md
+    ).diff(rendered);
+}
+
+test "completion matches titles case-insensitively" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "[Path](./zk/ALLOc\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/semantics.md",
+        "# Allocator Semantics\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/group.md",
+        "# Grouping Allocations\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| {
+            std.testing.allocator.free(item.label);
+            if (item.insert_text) |text| std.testing.allocator.free(text);
+            if (item.filter_text) |text| std.testing.allocator.free(text);
+        }
+        items.deinit(std.testing.allocator);
+    }
+
+    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 16 }, &items);
+    sortCompletionItems(items.items);
+    const rendered = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered);
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\Allocator Semantics
+        \\Grouping Allocations
+    ).diff(rendered);
+}
+
+test "completion matches subheadings when query matches" {
+    var server = Server.init(std.testing.allocator);
+    defer server.deinit();
+
+    try server.workspace.upsertDocument(
+        "file:///root/dir/a.md",
+        "[Path](./zk/own\n",
+    );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/owner.md",
+        "# Notes\n## Allocator Ownership\n",
+    );
+
+    const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
+
+    var items: std.ArrayList(CompletionItem) = .empty;
+    defer {
+        for (items.items) |item| {
+            std.testing.allocator.free(item.label);
+            if (item.insert_text) |text| std.testing.allocator.free(text);
+            if (item.filter_text) |text| std.testing.allocator.free(text);
+        }
+        items.deinit(std.testing.allocator);
+    }
+
+    try collectCompletions(&server, doc_a, .{ .line = 0, .character = 14 }, &items);
+    sortCompletionItems(items.items);
+    const rendered = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered);
+    const snap = Snap.snap_fn(".");
+    try snap(@src(),
+        \\Allocator Ownership
+    ).diff(rendered);
+}
+
 test "completion suggests snippets" {
     var server = Server.init(std.testing.allocator);
     defer server.deinit();
@@ -4139,6 +4350,7 @@ test "completion suggests snippets" {
         for (items.items) |item| {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
+            if (item.filter_text) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4424,7 +4636,11 @@ test "fuzz: completion and diagnostics JSON are valid" {
 
             var items: std.ArrayList(CompletionItem) = .empty;
             defer {
-                for (items.items) |item| std.testing.allocator.free(item.label);
+                for (items.items) |item| {
+                    std.testing.allocator.free(item.label);
+                    if (item.insert_text) |text| std.testing.allocator.free(text);
+                    if (item.filter_text) |text| std.testing.allocator.free(text);
+                }
                 items.deinit(std.testing.allocator);
             }
             try collectCompletions(&server, doc, .{ .line = 0, .character = 0 }, &items);
