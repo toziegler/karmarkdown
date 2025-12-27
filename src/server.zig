@@ -1192,7 +1192,7 @@ fn appendPathCompletions(
             continue;
         }
 
-        const label = try std.fmt.allocPrint(allocator, "{s} - {s}{s}", .{ title, lead, rel });
+        const label = try std.fmt.allocPrint(allocator, "{s}{s} — {s}", .{ lead, rel, title });
         const insert_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
         const filter_text = if (prefix.len > 0) try allocator.dupe(u8, prefix) else null;
         try items.append(allocator, .{
@@ -4128,8 +4128,8 @@ test "completion suggests wiki, paths, and headings" {
     const rendered_path_title = try renderCompletions(std.testing.allocator, items.items);
     defer std.testing.allocator.free(rendered_path_title);
     try snap(@src(),
-        \\Allocator - ./zk/allocator.md
-        \\Allocator Ownership - ./zk/owner.md
+        \\./zk/allocator.md — Allocator
+        \\./zk/owner.md — Allocator Ownership
         \\zk/allocator.md
     ).diff(rendered_path_title);
 }
@@ -4163,7 +4163,7 @@ test "completion sets filterText for title path matches" {
 
     var found = false;
     for (items.items) |item| {
-        if (!std.mem.eql(u8, item.label, "Allocator - ./zk/allocator.md")) continue;
+        if (!std.mem.eql(u8, item.label, "./zk/allocator.md — Allocator")) continue;
         found = true;
         try std.testing.expect(item.filter_text != null);
         try std.testing.expect(std.mem.eql(u8, item.filter_text.?, "./zk/alloc"));
@@ -4208,8 +4208,8 @@ test "completion matches multiple titles by query" {
     defer std.testing.allocator.free(rendered);
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\Allocator Semantics - ./zk/semantics.md
-        \\Grouping Allocations - ./zk/group.md
+        \\./zk/group.md — Grouping Allocations
+        \\./zk/semantics.md — Allocator Semantics
     ).diff(rendered);
 }
 
@@ -4294,8 +4294,8 @@ test "completion matches titles case-insensitively" {
     defer std.testing.allocator.free(rendered);
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\Allocator Semantics - ./zk/semantics.md
-        \\Grouping Allocations - ./zk/group.md
+        \\./zk/group.md — Grouping Allocations
+        \\./zk/semantics.md — Allocator Semantics
     ).diff(rendered);
 }
 
@@ -4330,7 +4330,7 @@ test "completion matches subheadings when query matches" {
     defer std.testing.allocator.free(rendered);
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\Allocator Ownership - ./zk/owner.md
+        \\./zk/owner.md — Allocator Ownership
     ).diff(rendered);
 }
 
