@@ -1093,6 +1093,8 @@ const TextEdit = struct {
     new_text: []const u8,
 };
 
+const max_action_selection_bytes = 64 * 1024;
+
 const EditBucket = struct {
     uri: []const u8,
     edits: std.ArrayListUnmanaged(TextEdit) = .empty,
@@ -1707,16 +1709,19 @@ fn normalizeLabel(label: []const u8) []const u8 {
 
 fn slugifyInto(text: []const u8, buf: []u8) []const u8 {
     var len: usize = 0;
+    var last_dash = false;
     for (text) |ch| {
         var lower = ch;
         if (ch >= 'A' and ch <= 'Z') lower = ch + 32;
         if ((lower >= 'a' and lower <= 'z') or (lower >= '0' and lower <= '9')) {
             if (len < buf.len) buf[len] = lower;
             len += 1;
+            last_dash = false;
         } else if (lower == ' ' or lower == '-' or lower == '_') {
-            if (len > 0 and buf[len - 1] != '-') {
+            if (!last_dash) {
                 if (len < buf.len) buf[len] = '-';
                 len += 1;
+                last_dash = true;
             }
         }
     }
@@ -2098,6 +2103,7 @@ fn buildExtractSelectionAction(
 ) !?[]const u8 {
     if (range.start.line == range.end.line and range.start.character == range.end.character) return null;
     const selection = sliceForRange(doc.text, range);
+    if (selection.len > max_action_selection_bytes) return null;
     if (std.mem.trim(u8, selection, " \t\r\n").len == 0) return null;
 
     const title = selectionTitle(selection);
@@ -2155,6 +2161,7 @@ fn buildCsvToTableAction(
 ) !?[]const u8 {
     if (range.start.line == range.end.line and range.start.character == range.end.character) return null;
     const selection = sliceForRange(doc.text, range);
+    if (selection.len > max_action_selection_bytes) return null;
     if (std.mem.trim(u8, selection, " \t\r\n").len == 0) return null;
     if (std.mem.indexOfScalar(u8, selection, ',') == null) return null;
 
@@ -2238,13 +2245,14 @@ fn buildInsertFootnoteAction(
 ) !?[]const u8 {
     const selection = sliceForRange(doc.text, range);
     const trimmed = std.mem.trim(u8, selection, " \t\r\n");
+    const slug_source = if (trimmed.len > 64) trimmed[0..64] else trimmed;
     var id_owned: ?[]u8 = null;
     defer if (id_owned) |buf| server.allocator.free(buf);
 
     var id: []const u8 = "";
-    if (trimmed.len > 0) {
+    if (slug_source.len > 0) {
         var buf: [64]u8 = undefined;
-        const slug = slugifyInto(trimmed, &buf);
+        const slug = slugifyInto(slug_source, &buf);
         if (slug.len > 0) {
             id_owned = try server.allocator.dupe(u8, slug);
             id = id_owned.?;
@@ -3247,6 +3255,114 @@ test "code action inserts related section" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "code action handles long bullet selection" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    const text =
+        \\- karmarkdown
+        \\    + add action selection and link 
+        \\    + insert link with fuzzy search
+        \\    - test the fuzz link 
+        \\    - update karmarkdown version on my nvim
+        \\
+        \\- review matklad k-way-merge implementation
+        \\    - code
+        \\    - video
+        \\    - maybe fix it?
+        \\
+        \\- hashtable design 
+        \\    - interface 
+        \\    - tests 
+        \\    - fuzzer pass 
+        \\    - faster batch ht implementation.
+        \\    - performance
+    ;
+
+    try server.workspace.upsertDocument("file:///root/a.md", text);
+
+    const end_pos = documentEndPosition(text);
+    const range = protocol.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = end_pos,
+    };
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    try params.put("range", try rangeValue(allocator, range));
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 31 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    try std.testing.expect(result_val == .array);
+}
+
+test "code action skips large selection extract" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    const size = max_action_selection_bytes + 1024;
+    const text = try allocator.alloc(u8, size);
+    defer allocator.free(text);
+    std.mem.set(u8, text, 'a');
+
+    try server.workspace.upsertDocument("file:///root/a.md", text);
+
+    const range = protocol.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = @intCast(size) },
+    };
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = "file:///root/a.md" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+    try params.put("range", try rangeValue(allocator, range));
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("id", std.json.Value{ .integer = 30 });
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleCodeAction(&server, &out.writer, root);
+    const message = try out.toOwnedSlice();
+    defer allocator.free(message);
+
+    const payload = extractPayload(message) orelse return error.TestExpectedPayload;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const result_val = parsed.value.object.get("result") orelse return error.TestExpectedResult;
+    if (result_val != .array) return error.TestExpectedArray;
+
+    for (result_val.array.items) |item| {
+        if (item != .object) continue;
+        const title_val = item.object.get("title") orelse continue;
+        if (title_val != .string) continue;
+        try std.testing.expect(!std.mem.eql(u8, title_val.string, "Extract selection to note"));
+        try std.testing.expect(!std.mem.eql(u8, title_val.string, "Convert CSV to table"));
+    }
 }
 
 test "snapshot: code action insert new note link" {
