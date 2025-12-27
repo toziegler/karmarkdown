@@ -295,6 +295,14 @@ fn handleDidOpen(server: *Server, writer: anytype, root: std.json.Value) !void {
 
     if (uri != .string or text != .string) return;
     try server.workspace.upsertDocument(uri.string, text.string);
+    if (uriToPath(server.allocator, uri.string)) |path| {
+        defer server.allocator.free(path);
+        if (!pathWithinRoots(server.workspace.rootsSlice(), path)) {
+            const dir = std.fs.path.dirname(path) orelse path;
+            server.workspace.addRoot(dir) catch {};
+            server.workspace.indexRootsIncremental() catch {};
+        }
+    }
     if (server.workspace.getDocument(uri.string)) |doc_val| {
         try publishDiagnostics(server, writer, doc_val);
     }
@@ -1610,6 +1618,17 @@ fn posInRange(pos: protocol.Position, range: protocol.Range) bool {
     if (pos.line == range.start.line and pos.character < range.start.character) return false;
     if (pos.line == range.end.line and pos.character > range.end.character) return false;
     return true;
+}
+
+fn pathWithinRoots(roots: []const []const u8, path: []const u8) bool {
+    for (roots) |root| {
+        if (root.len == 0) continue;
+        if (!std.mem.startsWith(u8, path, root)) continue;
+        if (path.len == root.len) return true;
+        const next = path[root.len];
+        if (next == '/' or next == '\\') return true;
+    }
+    return false;
 }
 
 fn resolveLink(
@@ -4588,6 +4607,44 @@ test "didChangeWatchedFiles adds, updates, removes" {
     defer deinitValue(std.testing.allocator, change_delete);
     try handleDidChangeWatchedFiles(&server, change_delete);
     try std.testing.expect(server.workspace.getDocument(uri) == null);
+}
+
+test "didOpen adds root for out-of-root documents" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("zk");
+    try tmp.dir.writeFile(.{ .sub_path = "zk/one.md", .data = "# One\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "zk/two.md", .data = "# Two\n" });
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const doc_path = try std.fs.path.join(allocator, &.{ root_path, "zk/one.md" });
+    defer allocator.free(doc_path);
+    const doc_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{doc_path});
+    defer allocator.free(doc_uri);
+
+    var params = std.json.ObjectMap.init(allocator);
+    var text_doc = std.json.ObjectMap.init(allocator);
+    try text_doc.put("uri", std.json.Value{ .string = doc_uri });
+    try text_doc.put("text", std.json.Value{ .string = "# One\n" });
+    try params.put("textDocument", std.json.Value{ .object = text_doc });
+
+    var root_obj = std.json.ObjectMap.init(allocator);
+    try root_obj.put("params", std.json.Value{ .object = params });
+    const root = std.json.Value{ .object = root_obj };
+    defer deinitValue(allocator, root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try handleDidOpen(&server, &out.writer, root);
+
+    try std.testing.expect(server.workspace.rootsSlice().len == 1);
+    try std.testing.expect(server.workspace.docs.count() >= 2);
 }
 
 test "fuzz: symbol JSON is valid" {
