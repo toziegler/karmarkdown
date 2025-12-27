@@ -1159,9 +1159,22 @@ fn appendPathCompletions(
         defer allocator.free(path);
         const rel = std.fs.path.relative(allocator, doc_dir, path) catch continue;
         defer allocator.free(rel);
-        if (!startsWithIgnoreCase(rel, prefix)) continue;
-        const label = try allocator.dupe(u8, rel);
-        try items.append(allocator, .{ .label = label });
+        if (startsWithIgnoreCase(rel, prefix)) {
+            const label = try allocator.dupe(u8, rel);
+            try items.append(allocator, .{ .label = label });
+        }
+        if (prefix.len == 0) continue;
+
+        const title = documentTitle(allocator, entry.value_ptr.*, entry.key_ptr.*) catch continue;
+        defer allocator.free(title);
+        if (!containsIgnoreCase(title, prefix)) continue;
+
+        const label = try std.fmt.allocPrint(allocator, "{s} - {s}", .{ title, rel });
+        const insert_text = try allocator.dupe(u8, rel);
+        try items.append(allocator, .{
+            .label = label,
+            .insert_text = insert_text,
+        });
     }
 }
 
@@ -1434,6 +1447,20 @@ fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
         if (lowerAscii(text[i]) != lowerAscii(ch)) return false;
     }
     return true;
+}
+
+fn containsIgnoreCase(text: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (text.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= text.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (lowerAscii(text[i + j]) != lowerAscii(needle[j])) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
 }
 
 fn lowerAscii(ch: u8) u8 {
@@ -3853,7 +3880,7 @@ test "completion suggests wiki, paths, and headings" {
 
     try server.workspace.upsertDocument(
         "file:///root/dir/a.md",
-        "[[b\n[Link](b.md#he)\n# Heading One\n## Heading Two\n",
+        "[[b\n[Link](b.md#he)\n[Title](He\n# Heading One\n## Heading Two\n",
     );
     try server.workspace.upsertDocument(
         "file:///root/dir/b.md",
@@ -3898,6 +3925,16 @@ test "completion suggests wiki, paths, and headings" {
     try snap(@src(),
         \\b.md
     ).diff(rendered_path);
+
+    items.clearRetainingCapacity();
+    try collectCompletions(&server, doc_a, .{ .line = 2, .character = 10 }, &items);
+    sortCompletionItems(items.items);
+    const rendered_title_path = try renderCompletions(std.testing.allocator, items.items);
+    defer std.testing.allocator.free(rendered_title_path);
+    try snap(@src(),
+        \\Heading One - a.md
+        \\Heading Two - b.md
+    ).diff(rendered_title_path);
 }
 
 test "completion suggests snippets" {
