@@ -1193,6 +1193,7 @@ fn appendPathCompletions(
     allocator: std.mem.Allocator,
     prefix: []const u8,
 ) !void {
+    const debug = debugCompletionEnabled();
     const doc_path = uriToPath(allocator, doc.uri) orelse return;
     defer allocator.free(doc_path);
     const doc_dir = std.fs.path.dirname(doc_path) orelse doc_path;
@@ -1202,6 +1203,7 @@ fn appendPathCompletions(
     const title_query = parts.query;
     const lead = pathLeadingPrefix(prefix);
 
+    const doc_count = server.workspace.docs.count();
     var it = server.workspace.docs.iterator();
     while (it.next()) |entry| {
         const path = uriToPath(allocator, entry.key_ptr.*) orelse continue;
@@ -1238,6 +1240,24 @@ fn appendPathCompletions(
             .filter_text = filter_text,
             .detail = detail,
         });
+    }
+
+    if (debug and items.items.len == 0 and (std.mem.startsWith(u8, prefix, "./") or std.mem.startsWith(u8, prefix, ".\\"))) {
+        std.debug.print(
+            "completion path debug uri=\"{s}\" doc_dir=\"{s}\" prefix=\"{s}\" dir_prefix=\"{s}\" docs={d}\n",
+            .{ doc.uri, doc_dir, prefix, dir_prefix, doc_count },
+        );
+        var count: usize = 0;
+        var it2 = server.workspace.docs.iterator();
+        while (it2.next()) |entry| {
+            const path = uriToPath(allocator, entry.key_ptr.*) orelse continue;
+            defer allocator.free(path);
+            const rel = std.fs.path.relative(allocator, doc_dir, path) catch continue;
+            defer allocator.free(rel);
+            std.debug.print("  rel=\"{s}\"\n", .{rel});
+            count += 1;
+            if (count >= 5) break;
+        }
     }
 }
 
