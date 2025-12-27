@@ -301,6 +301,12 @@ fn handleDidOpen(server: *Server, writer: anytype, root: std.json.Value) !void {
             const dir = std.fs.path.dirname(path) orelse path;
             server.workspace.addRoot(dir) catch {};
             server.workspace.indexRootsIncremental() catch {};
+            if (debugCompletionEnabled()) {
+                std.debug.print(
+                    "didOpen addRoot dir=\"{s}\" docs={d} roots={d}\n",
+                    .{ dir, server.workspace.docs.count(), server.workspace.rootsSlice().len },
+                );
+            }
         }
     }
     if (server.workspace.getDocument(uri.string)) |doc_val| {
@@ -1250,7 +1256,7 @@ fn appendPathCompletions(
         });
     }
 
-    if (debug and items.items.len == 0 and (std.mem.startsWith(u8, prefix, "./") or std.mem.startsWith(u8, prefix, ".\\"))) {
+    if (debug and (std.mem.startsWith(u8, prefix, "./") or std.mem.startsWith(u8, prefix, ".\\")) and std.mem.containsAtLeast(u8, prefix, 1, "/")) {
         std.debug.print(
             "completion path debug uri=\"{s}\" doc_dir=\"{s}\" prefix=\"{s}\" dir_prefix=\"{s}\" docs={d}\n",
             .{ doc.uri, doc_dir, prefix, dir_prefix, doc_count },
