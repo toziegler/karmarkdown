@@ -1002,6 +1002,10 @@ fn collectCompletions(
             try appendSnippetCompletions(items, server.allocator);
         },
     }
+
+    if (debugCompletionEnabled()) {
+        logCompletionDebug(ctx, prefix, items.items);
+    }
 }
 
 const CompletionContext = enum {
@@ -1019,6 +1023,32 @@ fn completionContext(line: []const u8, column: usize) CompletionContext {
     if (inInlineAnchorContext(before)) return .inline_anchor;
     if (inInlinePathContext(before)) return .inline_path;
     return .general;
+}
+
+fn debugCompletionEnabled() bool {
+    return std.posix.getenv("KARMARKDOWN_DEBUG_COMPLETION") != null;
+}
+
+fn logCompletionDebug(ctx: CompletionContext, prefix: []const u8, items: []const CompletionItem) void {
+    const ctx_name = switch (ctx) {
+        .wiki => "wiki",
+        .inline_path => "inline_path",
+        .inline_anchor => "inline_anchor",
+        .general => "general",
+    };
+    std.debug.print(
+        "completion ctx={s} prefix=\"{s}\" items={d}\n",
+        .{ ctx_name, prefix, items.len },
+    );
+    const limit = @min(items.len, 5);
+    var idx: usize = 0;
+    while (idx < limit) : (idx += 1) {
+        const item = items[idx];
+        std.debug.print("  - label=\"{s}\"", .{item.label});
+        if (item.insert_text) |text| std.debug.print(" insert=\"{s}\"", .{text});
+        if (item.detail) |text| std.debug.print(" detail=\"{s}\"", .{text});
+        std.debug.print("\n", .{});
+    }
 }
 
 fn completionPrefix(line: []const u8, column: usize, ctx: CompletionContext) []const u8 {
