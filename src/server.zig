@@ -1176,7 +1176,7 @@ fn appendPathCompletions(
             });
         }
 
-        const title = documentTitle(allocator, entry.value_ptr.*, entry.key_ptr.*) catch continue;
+        const title = bestTitleForQuery(allocator, entry.value_ptr.*, entry.key_ptr.*, title_query) catch continue;
         defer allocator.free(title);
         if (title_query.len == 0) {
             if (dir_prefix.len == 0) continue;
@@ -1476,6 +1476,22 @@ fn containsIgnoreCase(text: []const u8, needle: []const u8) bool {
         if (j == needle.len) return true;
     }
     return false;
+}
+
+fn bestTitleForQuery(
+    allocator: std.mem.Allocator,
+    doc: index.Document,
+    uri: []const u8,
+    query: []const u8,
+) ![]u8 {
+    if (query.len > 0) {
+        for (doc.headings) |heading| {
+            if (containsIgnoreCase(heading.text, query)) {
+                return allocator.dupe(u8, heading.text);
+            }
+        }
+    }
+    return documentTitle(allocator, doc, uri);
 }
 
 fn pathPrefixParts(prefix: []const u8) struct { dir_prefix: []const u8, query: []const u8 } {
@@ -4041,6 +4057,10 @@ test "completion suggests wiki, paths, and headings" {
         "file:///root/dir/zk/allocator.md",
         "# Allocator\n",
     );
+    try server.workspace.upsertDocument(
+        "file:///root/dir/zk/owner.md",
+        "# Notes\n## Allocator Ownership\n",
+    );
 
     const doc_a = server.workspace.getDocument("file:///root/dir/a.md").?;
 
@@ -4098,6 +4118,7 @@ test "completion suggests wiki, paths, and headings" {
     defer std.testing.allocator.free(rendered_path_title);
     try snap(@src(),
         \\Allocator
+        \\Allocator Ownership
         \\zk/allocator.md
     ).diff(rendered_path_title);
 }
