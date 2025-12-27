@@ -183,7 +183,7 @@ fn sendInitializeResponse(writer: anytype, root: std.json.Value) !void {
     try out.writeAll("\"documentSymbolProvider\":true,");
     try out.writeAll("\"workspaceSymbolProvider\":true,");
     try out.writeAll("\"codeActionProvider\":true,");
-    try out.writeAll("\"completionProvider\":{\"triggerCharacters\":[\"[\",\"#\"]}");
+    try out.writeAll("\"completionProvider\":{\"triggerCharacters\":[\"[\",\"#\",\"(\",\"/\"]}");
     try out.writeAll("}}}");
 
     try lsp.writeMessage(writer, payload.items);
@@ -424,6 +424,7 @@ const CompletionItem = struct {
     insert_text: ?[]const u8 = null,
     insert_text_format: ?u8 = null,
     filter_text: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
 };
 
 const Diagnostic = struct {
@@ -474,6 +475,7 @@ fn handleCompletion(server: *Server, writer: anytype, root: std.json.Value) !voi
             server.allocator.free(item.label);
             if (item.insert_text) |text| server.allocator.free(text);
             if (item.filter_text) |text| server.allocator.free(text);
+            if (item.detail) |text| server.allocator.free(text);
         }
         items.deinit(server.allocator);
     }
@@ -617,6 +619,10 @@ fn sendCompletionResult(
         if (item.filter_text) |filter_text| {
             try out.writeAll(",\"filterText\":");
             try protocol.writeJsonString(out, filter_text);
+        }
+        if (item.detail) |detail| {
+            try out.writeAll(",\"detail\":");
+            try protocol.writeJsonString(out, detail);
         }
         if (item.insert_text) |insert_text| {
             try out.writeAll(",\"insertText\":");
@@ -1176,7 +1182,7 @@ fn appendPathCompletions(
         if (startsWithIgnoreCase(rel, match_prefix)) {
             const label = try allocator.dupe(u8, rel);
             const insert_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
-            const filter_text = if (prefix.len > 0) try allocator.dupe(u8, prefix) else null;
+            const filter_text = try allocator.dupe(u8, rel);
             try items.append(allocator, .{
                 .label = label,
                 .insert_text = insert_text,
@@ -1192,13 +1198,15 @@ fn appendPathCompletions(
             continue;
         }
 
-        const label = try std.fmt.allocPrint(allocator, "{s}{s} — {s}", .{ lead, rel, title });
+        const label = try allocator.dupe(u8, title);
         const insert_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
-        const filter_text = if (prefix.len > 0) try allocator.dupe(u8, prefix) else null;
+        const filter_text = try allocator.dupe(u8, title);
+        const detail = try std.fmt.allocPrint(allocator, "{s}{s}", .{ lead, rel });
         try items.append(allocator, .{
             .label = label,
             .insert_text = insert_text,
             .filter_text = filter_text,
+            .detail = detail,
         });
     }
 }
@@ -4080,6 +4088,7 @@ test "completion suggests wiki, paths, and headings" {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
             if (item.filter_text) |text| std.testing.allocator.free(text);
+            if (item.detail) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4128,8 +4137,8 @@ test "completion suggests wiki, paths, and headings" {
     const rendered_path_title = try renderCompletions(std.testing.allocator, items.items);
     defer std.testing.allocator.free(rendered_path_title);
     try snap(@src(),
-        \\./zk/allocator.md — Allocator
-        \\./zk/owner.md — Allocator Ownership
+        \\Allocator
+        \\Allocator Ownership
         \\zk/allocator.md
     ).diff(rendered_path_title);
 }
@@ -4155,6 +4164,7 @@ test "completion sets filterText for title path matches" {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
             if (item.filter_text) |text| std.testing.allocator.free(text);
+            if (item.detail) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4163,12 +4173,14 @@ test "completion sets filterText for title path matches" {
 
     var found = false;
     for (items.items) |item| {
-        if (!std.mem.eql(u8, item.label, "./zk/allocator.md — Allocator")) continue;
+        if (!std.mem.eql(u8, item.label, "Allocator")) continue;
         found = true;
         try std.testing.expect(item.filter_text != null);
-        try std.testing.expect(std.mem.eql(u8, item.filter_text.?, "./zk/alloc"));
+        try std.testing.expect(std.mem.eql(u8, item.filter_text.?, "Allocator"));
         try std.testing.expect(item.insert_text != null);
         try std.testing.expect(std.mem.eql(u8, item.insert_text.?, "./zk/allocator.md"));
+        try std.testing.expect(item.detail != null);
+        try std.testing.expect(std.mem.eql(u8, item.detail.?, "./zk/allocator.md"));
     }
     try std.testing.expect(found);
 }
@@ -4198,6 +4210,7 @@ test "completion matches multiple titles by query" {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
             if (item.filter_text) |text| std.testing.allocator.free(text);
+            if (item.detail) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4208,8 +4221,8 @@ test "completion matches multiple titles by query" {
     defer std.testing.allocator.free(rendered);
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\./zk/group.md — Grouping Allocations
-        \\./zk/semantics.md — Allocator Semantics
+        \\Allocator Semantics
+        \\Grouping Allocations
     ).diff(rendered);
 }
 
@@ -4242,6 +4255,7 @@ test "completion matches titles by directory prefix only" {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
             if (item.filter_text) |text| std.testing.allocator.free(text);
+            if (item.detail) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4284,6 +4298,7 @@ test "completion matches titles case-insensitively" {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
             if (item.filter_text) |text| std.testing.allocator.free(text);
+            if (item.detail) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4294,8 +4309,8 @@ test "completion matches titles case-insensitively" {
     defer std.testing.allocator.free(rendered);
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\./zk/group.md — Grouping Allocations
-        \\./zk/semantics.md — Allocator Semantics
+        \\Allocator Semantics
+        \\Grouping Allocations
     ).diff(rendered);
 }
 
@@ -4320,6 +4335,7 @@ test "completion matches subheadings when query matches" {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
             if (item.filter_text) |text| std.testing.allocator.free(text);
+            if (item.detail) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4330,7 +4346,7 @@ test "completion matches subheadings when query matches" {
     defer std.testing.allocator.free(rendered);
     const snap = Snap.snap_fn(".");
     try snap(@src(),
-        \\./zk/owner.md — Allocator Ownership
+        \\Allocator Ownership
     ).diff(rendered);
 }
 
@@ -4351,6 +4367,7 @@ test "completion suggests snippets" {
             std.testing.allocator.free(item.label);
             if (item.insert_text) |text| std.testing.allocator.free(text);
             if (item.filter_text) |text| std.testing.allocator.free(text);
+            if (item.detail) |text| std.testing.allocator.free(text);
         }
         items.deinit(std.testing.allocator);
     }
@@ -4640,6 +4657,7 @@ test "fuzz: completion and diagnostics JSON are valid" {
                     std.testing.allocator.free(item.label);
                     if (item.insert_text) |text| std.testing.allocator.free(text);
                     if (item.filter_text) |text| std.testing.allocator.free(text);
+                    if (item.detail) |text| std.testing.allocator.free(text);
                 }
                 items.deinit(std.testing.allocator);
             }
